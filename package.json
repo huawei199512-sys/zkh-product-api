@@ -1,10 +1,13 @@
 {
   "name": "zkh-product-api",
-  "version": "1.0.0",
-  "description": "震坤行(zkh.com)商品详情和关键字搜索API - 无登录 + 免费代理IP池方案",
+  "version": "2.0.0",
+  "description": "震坤行(zkh.com)商品详情和关键字搜索API - 代理IP + Cookie自动化获取 + 无登录",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "fetch-cookie": "node cookieFetcher.js",
+    "fetch-cookie:daemon": "node cookieFetcher.js --daemon",
+    "auto": "node cookieFetcher.js && node server.js",
     "test": "node test.js"
   },
   "dependencies": {
@@ -15,6 +18,7 @@
     "express": "^4.18.0",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.4",
+    "puppeteer-core": "^21.0.0",
     "socks-proxy-agent": "^7.0.0",
     "tough-cookie": "^4.1.3"
   },
