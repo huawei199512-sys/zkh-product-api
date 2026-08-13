@@ -1,114 +1,68 @@
-// 震坤行(zkh.com)商品详情和关键字搜索API - 无登录 + 强制免费代理IP池
-// 参考1688 API架构（huawei199512-sys/api_1688）重新实现
+// 震坤行(zkh.com)爬虫服务 - Express HTTP Server
+// 代理IP + Cookie会话复用 + 多轮重试架构
 const express = require('express');
 const cors = require('cors');
-const scraperZKH = require('./scraperZKH');
 const proxyManager = require('./proxyManager');
+const scraperZKH = require('./scraperZKH');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
-// ============ 全局错误防护 ============
-process.on('uncaughtException', (err) => {
-  console.error('[UncaughtException]', err.message);
-});
-process.on('unhandledRejection', (err) => {
-  console.error('[UnhandledRejection]', err && err.message ? err.message : err);
+// ============ 全局错误处理 ============
+app.use((err, req, res, next) => {
+  console.error('[Global Error]', err);
+  res.status(500).json({ success: false, error: err.message });
 });
 
-// ============ 健康检查端点（Render必需）============
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// ============ 首页 - API说明 ============
+// ============ 基础路由 ============
 app.get('/', (req, res) => {
+  const cookieSt = scraperZKH.getCookieStatus();
   res.json({
-    service: '震坤行 ZKH Product API',
-    version: '1.0.0',
-    description: '震坤行(zkh.com)商品详情和关键字搜索API - 无登录 + 免费代理IP池方案',
-    mode: '无登录 + 强制免费代理IP + H5页面解析兜底 + Cookie会话复用',
-    features: {
-      login_required: false,
-      proxy_mode: '强制代理模式 - 13源自动刷新代理池（与1688/Amazon方案一致）',
-      protocols_supported: ['HTTP', 'HTTPS', 'SOCKS4', 'SOCKS5'],
-      detail_source: '/servezkhApi/goods/* 系列接口聚合 + /item H5页面解析兜底',
-      search_source: '/servezkhApi/search/product/pc API + 搜索页H5兜底',
-      strategy: 'Cookie会话建立 -> 5代理并发竞态 × 最多10轮 -> 成功立即返回，每2轮自动刷新代理池',
-      proxy_pool: '13源自动刷新代理池（每30分钟后台刷新，每次最小5分钟间隔）',
-      cookie_session: {
-        jar: '全局 tough-cookie CookieJar 多请求共享会话 Cookie',
-        init_priority_1: '环境变量 ZKH_COOKIE_FROM_BROWSER 注入（过了滑块的浏览器Cookie，最可靠）',
-        init_priority_2: '访问 https://www.zkh.com/ 首页获取 Set-Cookie 建立会话',
-      },
-      free_proxy_only: true,
-    },
+    service: 'ZKH Product API',
+    version: '2.0.0-cookie',
+    description: '震坤行商品搜索与详情API（代理IP+Cookie会话复用+无登录）',
     endpoints: {
-      search: 'GET /api/search?q=关键词&page=1&pageSize=40',
-      detail: 'GET /api/detail/:skuNo',
-      proxy_status: 'GET /api/proxy/status',
-      proxy_refresh: 'POST /api/proxy/refresh',
-      cookie_status: 'GET /api/cookie/status',
-      cookie_reset: 'POST /api/cookie/reset',
+      health: '/health',
+      search: '/api/search?q=关键字&page=1&pageSize=40',
+      detail: '/api/detail/:skuNo',
+      cookie_status: '/api/cookie/status',
+      cookie_reset: '/api/cookie/reset',
+      debug_env: '/api/debug/env',
+      proxy_status: '/api/proxy/status',
+      proxy_refresh: '/api/proxy/refresh',
     },
+    proxy: {
+      strategy: '免费代理池 + 并发竞态 + 多轮重试',
+      sources: 13,
+      concurrent: 5,
+      max_rounds: 10,
+      single_proxy_timeout: '10s',
+      total_timeout: '60s',
+    },
+    cookie: cookieSt,
     env_vars: {
       ZKH_COOKIE_FROM_BROWSER: '从浏览器 zkh.com 的 document.cookie 复制过来，过了滑块后的会话Cookie（强烈推荐配置）',
     },
-    examples: {
-      search: 'GET /api/search?q=手套&page=1&pageSize=40',
-      detail: 'GET /api/detail/KG2089',
-    },
-    cookie_status: scraperZKH.getCookieStatus(),
-    proxy_status: proxyManager.getStatus(),
   });
 });
 
-// ============ 搜索商品 ============
-app.get('/api/search', async (req, res) => {
-  try {
-    const { q, keyword, page = 1, pageSize = 40 } = req.query;
-    const kw = q || keyword;
-    if (!kw) {
-      return res.status(400).json({ success: false, error: 'q或keyword参数必填' });
-    }
-    proxyManager.setEnabled(true);
-    const result = await scraperZKH.searchProducts(String(kw), parseInt(page), parseInt(pageSize));
-    res.json(result);
-  } catch (error) {
-    console.error('[Search] error:', error);
-    res.status(500).json({ success: false, error: error.message || '搜索异常' });
-  }
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
 });
 
-// ============ 商品详情 ============
-app.get('/api/detail/:skuNo', async (req, res) => {
-  try {
-    const { skuNo } = req.params;
-    if (!skuNo) {
-      return res.status(400).json({ success: false, error: 'skuNo参数必填' });
-    }
-    proxyManager.setEnabled(true);
-    const result = await scraperZKH.getProductDetail(String(skuNo).toUpperCase());
-    res.json(result);
-  } catch (error) {
-    console.error('[Detail] error:', error);
-    res.status(500).json({ success: false, error: error.message || '详情异常' });
-  }
-});
-
-// ============ 代理状态 ============
+// ============ 代理池管理接口 ============
 app.get('/api/proxy/status', (req, res) => {
-  res.json(proxyManager.getStatus());
+  try {
+    const status = proxyManager.getStatus();
+    res.json({ success: true, ...status });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-// ============ 手动刷新代理池 ============
 app.post('/api/proxy/refresh', async (req, res) => {
   try {
     await proxyManager.refreshProxies(true);
@@ -154,6 +108,20 @@ app.get('/api/cookie/reset', (req, res) => {
   }
 });
 
+// ============ 调试：检查环境变量 ============
+app.get('/api/debug/env', (req, res) => {
+  const cookieVal = process.env.ZKH_COOKIE_FROM_BROWSER || '';
+  res.json({
+    zkh_cookie_from_browser_exists: !!cookieVal,
+    zkh_cookie_from_browser_length: cookieVal.length,
+    zkh_cookie_from_browser_preview: cookieVal.substring(0, 20) + (cookieVal.length > 20 ? '...' : ''),
+    has_zkh_cookie: Object.keys(process.env).some(k => k.includes('ZKH')),
+    all_zkh_keys: Object.keys(process.env).filter(k => k.includes('ZKH')),
+    node_env: process.env.NODE_ENV || 'not set',
+    render: process.env.RENDER || 'not set',
+  });
+});
+
 // ============ 兜底路由 ============
 app.use((req, res) => {
   res.status(404).json({
@@ -164,40 +132,47 @@ app.use((req, res) => {
       'GET /health',
       'GET /api/search?q=xxx&page=1&pageSize=40',
       'GET /api/detail/:skuNo',
+      'GET /api/cookie/status',
+      'GET /api/cookie/reset',
+      'GET /api/debug/env',
       'GET /api/proxy/status',
       'POST /api/proxy/refresh',
-      'GET /api/cookie/status',
-      'POST /api/cookie/reset',
     ],
   });
 });
 
-// ============ 先启动服务，再后台初始化代理池（Render健康检查优先）============
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('========================================');
-  console.log('  震坤行 ZKH Product API 已启动');
-  console.log('  监听端口: ' + PORT);
-  console.log('  模式: 无登录 + 强制免费代理IP + Cookie会话复用');
-  console.log('========================================');
-  // 服务启动后，后台静默初始化代理池
-  setTimeout(async () => {
-    try {
-      console.log('[Init] 后台初始化代理池...');
-      await proxyManager.refreshProxies(true);
-      console.log('[Init] 代理池初始化完成:', proxyManager.getStatus());
-    } catch (e) {
-      console.warn('[Init] 代理池初始化失败（请求时会重试）:', e.message);
-    }
-  }, 1000);
-  // 启动自动刷新
-  proxyManager.startAutoRefresh();
-});
+// ============ 启动 ============
+async function start() {
+  console.log('============================================');
+  console.log('  ZKH Product API Server v2.0.0-cookie');
+  console.log('  端口:', PORT);
+  console.log('  代理池: 13源 + 并发5 + 10轮重试');
+  console.log('  Cookie: 会话复用 + 浏览器Cookie注入');
+  console.log('============================================');
 
-// ============ Render免费版5分钟定时刷新代理池 ============
-setInterval(async () => {
+  // 初始化代理池
   try {
     await proxyManager.refreshProxies(false);
+    console.log('[Init] 代理池初始化完成');
   } catch (e) {
-    console.warn('[AutoRefresh] 代理刷新异常:', e.message);
+    console.warn('[Init] 代理池初始化失败，将在请求时重试:', e.message);
   }
-}, 5 * 60 * 1000);
+
+  // 检查环境变量
+  const envCookie = process.env.ZKH_COOKIE_FROM_BROWSER;
+  if (envCookie) {
+    console.log('[Init] 检测到浏览器Cookie环境变量，长度:', envCookie.length);
+  } else {
+    console.log('[Init] 未检测到浏览器Cookie环境变量（ZKH_COOKIE_FROM_BROWSER）');
+    console.log('[Init] 建议配置以获得更稳定的请求成功率');
+  }
+
+  app.listen(PORT, () => {
+    console.log(`\n🚀 服务已启动: http://localhost:${PORT}`);
+  });
+}
+
+start().catch(e => {
+  console.error('启动失败:', e);
+  process.exit(1);
+});
