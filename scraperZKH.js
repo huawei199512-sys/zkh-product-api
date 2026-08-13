@@ -1,4 +1,4 @@
-// 震坤行(zkh.com)爬虫服务 - 无登录 + 代理IP + 竞态多轮重试
+// 震坤行(zkh.com)爬虫服务 - Cookie会话复用 + 代理IP + 竞态多轮重试
 // 分析自浏览器捕获的真实API：
 //   搜索:  POST /servezkhApi/search/product/pc
 //   详情:  GET  /servezkhApi/goods/1/coupons/{SKU}
@@ -11,10 +11,12 @@
 //          GET  /servezkhApi/goods/combination/{SKU}
 //          POST /servezkhApi/search/1/spuItemThumbnailInfo
 //   认证:  GET /zkhweb/zkhAuth/rsaKey, signToken, u_atoken/u_asig Cookie
-// 策略：多代理并发竞态 -> 成功立即返回 -> 循环重试多轮
+// 策略：Cookie会话建立(访问首页) -> 复用Cookie + 多代理并发竞态 -> 成功立即返回 -> 循环重试多轮
 const axios = require('axios');
 const cheerio = require('cheerio');
 const crypto = require('crypto');
+const { CookieJar } = require('tough-cookie');
+const { wrapper } = require('axios-cookiejar-support');
 const proxyManager = require('./proxyManager');
 
 // ============ 配置 ============
@@ -35,6 +37,56 @@ const TOTAL_REQUEST_TIMEOUT = 60000; // 单次用户请求 60s 绝对截止（�
 const CONCURRENT_PROXIES = 5;
 const MAX_ROUNDS = 10;
 
+// ============ Cookie 会话管理 ============
+// 全局 Cookie Jar（多个请求共享同一会话 Cookie）
+let globalCookieJar = new CookieJar();
+// 创建带有 cookie 支持的 axios 实例（可选：每次直接传 jar 参数也行，这里直接用全局 jar）
+let cookieAxios = wrapper(axios.create({ jar: globalCookieJar, withCredentials: true }));
+
+// 用户从浏览器复制的 Cookie（环境变量注入：过了滑块验证后的 Cookie）
+const USER_COOKIE_FROM_BROWSER = process.env.ZKH_COOKIE_FROM_BROWSER || '';
+// 会话是否已初始化（访问过首页建立了可信 Cookie）
+let sessionInitialized = false;
+
+/**
+ * 把环境变量 ZKH_COOKIE_FROM_BROWSER 注入到 CookieJar
+ * 格式：document.cookie 的原始字符串，比如 "sajssdk_2015_cross_new_user=xxx; anonymous_id=yyy; citycode=shanghai"
+ */
+function injectBrowserCookieIntoJar() {
+  if (!USER_COOKIE_FROM_BROWSER) return { ok: false, count: 0 };
+  try {
+    let count = 0;
+    const cookies = USER_COOKIE_FROM_BROWSER.split(';').filter(Boolean);
+    for (const raw of cookies) {
+      const idx = raw.indexOf('=');
+      if (idx === -1) continue;
+      const name = raw.slice(0, idx).trim();
+      const value = raw.slice(idx + 1).trim();
+      if (!name) continue;
+      // 写入 jar，domain 设为 .zkh.com，path 设为 /
+      try {
+        globalCookieJar.setCookieSync(`${name}=${value}`, ZKH_BASE);
+        count++;
+      } catch {}
+    }
+    console.log(`[Cookie] 已从环境变量注入 ${count} 个浏览器 Cookie`);
+    return { ok: true, count };
+  } catch (e) {
+    console.warn('[Cookie] 浏览器 Cookie 注入失败:', e.message);
+    return { ok: false, count: 0, error: e.message };
+  }
+}
+
+/**
+ * 输出当前 jar 中的 Cookie 数量（调试用）
+ */
+function getCookieStatus() {
+  try {
+    const all = globalCookieJar.getCookiesSync(ZKH_BASE);
+    return { jar_count: all.length, names: all.map(c => c.key) };
+  } catch { return { jar_count: 0, names: [] }; }
+}
+
 function randomUA() { return DESKTOP_UAS[Math.floor(Math.random() * DESKTOP_UAS.length)]; }
 function generateTraceId() {
   const now = Date.now();
@@ -42,14 +94,54 @@ function generateTraceId() {
   return `${now}${rand}${Math.floor(Math.random() * 10)}`;
 }
 
-// ============ 单次带代理的请求（按经验1387200：错误分级标记）============
+// ============ 单次带代理的请求（按经验1387200：错误分级标记 + CookieJar复用）============
 function isSevereProxyError(msgOrCode) {
   if (!msgOrCode) return false;
   const s = String(msgOrCode).toUpperCase();
   // 证书类 / 鉴权类 / 协议不兼容 → 严重坏代理（5分钟不碰）
   return /CERT|TLS|SSL|403|407|405|PROXY_AUTH|ECONNREFUSED|HANDSHAKE|UNABLE_TO_VERIFY|CERT_HAS_EXPIRED/.test(s);
 }
-async function requestWithProxy({ method = 'GET', url, headers = {}, params = {}, data = null, proxy = null }) {
+
+/**
+ * 初始化 Cookie 会话：
+ * 优先级1: 从环境变量 ZKH_COOKIE_FROM_BROWSER 注入（过了滑块的 Cookie 最可靠）
+ * 优先级2: 通过代理访问首页，获取 Set-Cookie 建立可信会话
+ */
+async function ensureSession(proxy = null) {
+  if (sessionInitialized) return { ok: true, source: 'cached' };
+  try {
+    // 优先级1：尝试从环境变量注入 Cookie
+    const injected = injectBrowserCookieIntoJar();
+    if (injected.ok && injected.count > 0) {
+      sessionInitialized = true;
+      return { ok: true, source: 'env_inject', count: injected.count };
+    }
+    // 优先级2：访问首页建立会话（通过代理获取 Set-Cookie）
+    const homeHeaders = {
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Upgrade-Insecure-Requests': '1',
+    };
+    const r = await requestWithProxyRaw({
+      method: 'GET', url: ZKH_BASE + '/', headers: homeHeaders, proxy,
+      extraSessionInit: true,
+    });
+    if (r.success) {
+      const st = getCookieStatus();
+      sessionInitialized = true;
+      console.log(`[Session] 已通过首页建立会话，Cookie数=${st.jar_count}`);
+      return { ok: true, source: 'homepage', cookie_count: st.jar_count };
+    }
+    return { ok: false, error: r.error };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/**
+ * 底层请求函数：带 CookieJar + 代理 + 超时 + 错误分级
+ * extraSessionInit: true 时表示这是初始化会话的请求，不应递归调 ensureSession
+ */
+async function requestWithProxyRaw({ method = 'GET', url, headers = {}, params = {}, data = null, proxy = null, extraSessionInit = false }) {
   const traceId = generateTraceId();
   const allParams = { ...params, traceId: (params || {}).traceId || traceId };
   const allHeaders = {
@@ -73,20 +165,23 @@ async function requestWithProxy({ method = 'GET', url, headers = {}, params = {}
   const controller = new AbortController();
   const timeoutTimer = setTimeout(() => controller.abort(), SINGLE_PROXY_TIMEOUT);
   try {
+    // 使用带 cookieAxios 支持的 axios 实例，并显式传入 jar
     const axiosArgs = {
       method, url, params: allParams,
       headers: allHeaders,
       signal: controller.signal,
       timeout: SINGLE_PROXY_TIMEOUT,
       responseType: 'text',
+      withCredentials: true,
+      jar: globalCookieJar,
       ...proxyCfg,
     };
     // 按经验1387200：GET传 (url, config) / POST传 (url, data, config) 参数分离
     let resp;
     if (method.toUpperCase() === 'GET' || method.toUpperCase() === 'DELETE' || method.toUpperCase() === 'HEAD') {
-      resp = await axios(axiosArgs);
+      resp = await cookieAxios(axiosArgs);
     } else {
-      resp = await axios({ ...axiosArgs, data });
+      resp = await cookieAxios({ ...axiosArgs, data });
     }
     clearTimeout(timeoutTimer);
     return { success: true, data: resp.data, status: resp.status, proxy };
@@ -97,6 +192,16 @@ async function requestWithProxy({ method = 'GET', url, headers = {}, params = {}
     proxyManager.markBad(proxy, isSevereProxyError(msg));
     return { success: false, error: msg, code: err.code || null, status: err.response?.status || null, proxy };
   }
+}
+
+/**
+ * 对外暴露的请求函数：先确保 Cookie 会话存在，再发起请求
+ * （这是外部代码唯一应该调用的请求入口）
+ */
+async function requestWithProxy({ method = 'GET', url, headers = {}, params = {}, data = null, proxy = null }) {
+  // 初始化会话（除了初始化请求本身，避免死循环）
+  await ensureSession(proxy);
+  return await requestWithProxyRaw({ method, url, headers, params, data, proxy });
 }
 
 // ============ 竞态并发执行（与1688一致）============
@@ -860,4 +965,22 @@ function mergeDetailData({ skuNo, pageParse, couponsRaw, tagsRaw, freightRaw, re
   };
 }
 
-module.exports = { searchProducts, getProductDetail };
+/**
+ * 重置 Cookie 会话：清空 Jar + 撤销已初始化标记
+ * 场景：当前会话被 WAF 封了（频繁滑块 / 403），想从头建立新会话
+ */
+function resetSession() {
+  try {
+    const oldStatus = getCookieStatus();
+    globalCookieJar = new CookieJar();
+    // 同步更新 cookieAxios 所使用的 jar（cookieAxios 创建时绑定了旧 jar，需要重建）
+    cookieAxios = wrapper(axios.create({ jar: globalCookieJar, withCredentials: true }));
+    sessionInitialized = false;
+    console.log(`[Session] 已重置会话（旧Cookie:${oldStatus.jar_count}个已清空）`);
+    return { ok: true, old_cookie_count: oldStatus.jar_count, new_status: getCookieStatus() };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+module.exports = { searchProducts, getProductDetail, getCookieStatus, resetSession };
