@@ -127,6 +127,7 @@ async function multiRoundRun(taskFn, roundCount = MAX_ROUNDS, concurrent = CONCU
 }
 
 // ============ 关键字搜索 ============
+// 搜索API需要签名认证（返回code:5000"非法请求"），改为直接解析搜索页HTML
 async function searchProducts(keyword, page = 1, pageSize = 40) {
   const result = await multiRoundRun(async (proxy) => {
     // Step 1: 先 GET 首页获取cookie/环境（通过代理）
@@ -135,46 +136,44 @@ async function searchProducts(keyword, page = 1, pageSize = 40) {
     };
     await requestWithProxy({ url: ZKH_BASE + '/', headers: homeHeaders, proxy });
 
-    // Step 2: 调用搜索API
-    const searchUrl = `${ZKH_API_BASE}/search/product/pc`;
-    const postData = {
-      keyword,
-      page: Number(page),
-      pageSize: Number(pageSize),
-      sort: '',
-      order: '',
-      filter: {},
-      areaCode: '',
+    // Step 2: 直接请求搜索页HTML（搜索API需签名认证，改用HTML解析）
+    const searchPageUrl = `${ZKH_BASE}/search.html?keywords=${encodeURIComponent(keyword)}&hasLinkWord=`;
+    const searchHeaders = {
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Referer': ZKH_BASE + '/',
     };
-    const headers = {
-      'Content-Type': 'application/json;charset=UTF-8',
-      'Referer': `${ZKH_BASE}/search.html?keywords=${encodeURIComponent(keyword)}&hasLinkWord=`,
-    };
-    const resp = await requestWithProxy({
-      method: 'POST', url: searchUrl, data: postData, headers, proxy
-    });
+    const resp = await requestWithProxy({ url: searchPageUrl, headers: searchHeaders, proxy });
     if (!resp.success) return resp;
+
+    // Step 3: 从HTML中解析商品列表（优先方案）
+    const parsed = tryParseSearchFromHtml(resp.data, keyword, page, pageSize, proxy);
+    if (parsed && parsed.success && parsed.data?.products?.length > 0) return parsed;
+
+    // Step 4: HTML解析失败，尝试搜索API（带Cookie后可能能工作）
+    const searchApiUrl = `${ZKH_API_BASE}/search/product/pc`;
+    const postData = {
+      keyword, page: Number(page), pageSize: Number(pageSize),
+      sort: '', order: '', filter: {}, areaCode: '',
+    };
+    const apiHeaders = {
+      'Content-Type': 'application/json;charset=UTF-8',
+      'Referer': searchPageUrl,
+    };
+    const apiResp = await requestWithProxy({
+      method: 'POST', url: searchApiUrl, data: postData, headers: apiHeaders, proxy
+    });
+    if (!apiResp.success) return apiResp;
     try {
-      const parsed = typeof resp.data === 'string' ? JSON.parse(resp.data) : resp.data;
-      // 震坤行格式：success/code/message/result 结构
-      const code = parsed.code || parsed.resultCode || parsed.status;
-      const ok = parsed.success === true || parsed.msg === '成功' || code === 200 || code === '0000' || code === '0' || code === 0;
-      if (ok && (parsed.result || parsed.data)) {
-        const raw = parsed.result || parsed.data;
+      const parsedApi = typeof apiResp.data === 'string' ? JSON.parse(apiResp.data) : apiResp.data;
+      const code = parsedApi.code || parsedApi.resultCode || parsedApi.status;
+      const ok = parsedApi.success === true || code === '0000' || code === 200 || code === '0' || code === 0;
+      if (ok && (parsedApi.result || parsedApi.data)) {
+        const raw = parsedApi.result || parsedApi.data;
         return { success: true, data: parseSearchResult(raw, keyword, page, pageSize), proxy };
       }
-      // 还尝试解析缩略图API补全图片
-      try {
-        const thumbUrl = `${ZKH_API_BASE}/search/1/spuItemThumbnailInfo`;
-        const items = extractSkusFromSearch(parsed);
-        if (items && items.length) {
-          await requestWithProxy({ method: 'POST', url: thumbUrl, data: { skuNos: items.slice(0, 20) }, headers, proxy });
-        }
-      } catch {}
-      return { success: false, error: (parsed.msg || parsed.message || ('code=' + code)), proxy };
+      return { success: false, error: (parsedApi.msg || parsedApi.message || ('code=' + code)), proxy };
     } catch (e) {
-      // 可能不是JSON，尝试H5页面解析
-      return tryParseSearchFromHtml(resp.data, keyword, page, pageSize, proxy);
+      return { success: false, error: 'api parse error: ' + e.message, proxy };
     }
   });
   return formatSearchResult(result, keyword, page, pageSize);
@@ -218,36 +217,223 @@ function parseSearchResult(raw, keyword, page, pageSize) {
   };
 }
 
+// WAF滑块验证页面检测
+function isWafBlocked(html) {
+  if (!html || typeof html !== 'string') return false;
+  return html.includes('访问验证') || html.includes('滑动验证') || html.includes('请按住滑块') ||
+    html.includes('请进行验证') || html.includes('slider') && html.includes('verify');
+}
+// 登录重定向检测
+function isLoginRedirect(html) {
+  if (!html || typeof html !== 'string') return false;
+  return html.includes('passport.zkh.com') || html.includes('请先登录') || html.includes('登录后查看');
+}
+
 function tryParseSearchFromHtml(html, keyword, page, pageSize, proxy) {
   try {
+    // WAF拦截检测
+    if (isWafBlocked(html)) return { success: false, error: 'WAF blocked (slider)', proxy };
+    // 登录重定向检测
+    if (isLoginRedirect(html)) return { success: false, error: 'login redirect', proxy };
+
     const $ = cheerio.load(html || '');
-    // 从Next.js __next_f 或者 script中提取
-    let parsed = null;
-    $('script').each((_, s) => {
-      const txt = $(s).text() || '';
-      const init = txt.match(/self\.__next_f\.push\(\[1,"([\s\S]{100,}?)"\]\)/);
-      if (init && !parsed) { try { parsed = init[1]; } catch {} }
-    });
+    const stripHtml = (s) => (typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : (s ?? ''));
     const products = [];
-    $('.product-item, .sku-item, [class*="productCard"], [class*="sku-card"], li[class*="product"]').each((_, el) => {
-      const $el = $(el);
-      const title = $el.find('[class*="title"], h3, h4, a[title]').first().text().trim();
-      const href = $el.find('a[href]').first().attr('href') || '';
-      const m = href.match(/\/item\/([A-Za-z0-9]+)\.html/);
-      const sku = m ? m[1] : ($el.attr('data-sku') || $el.attr('data-sku-no') || '');
-      if (!sku && !title) return;
-      products.push({
-        sku_no: sku,
-        title,
-        price: $el.find('[class*="price"]').first().text().trim() || null,
-        image: $el.find('img').first().attr('src') || $el.find('img').first().attr('data-src') || '',
-        url: href.startsWith('http') ? href : (href.startsWith('/') ? ZKH_BASE + href : ''),
+    const seenSkus = new Set();
+    const addProduct = (p) => {
+      if (!p.sku_no || seenSkus.has(String(p.sku_no))) return;
+      seenSkus.add(String(p.sku_no));
+      products.push(p);
+    };
+
+    // 方案1: 从 __NEXT_DATA__ JSON 中提取（Next.js Pages Router）
+    const nextDataScript = $('#__NEXT_DATA__').html();
+    if (nextDataScript) {
+      try {
+        const nextData = JSON.parse(nextDataScript);
+        const pageProps = nextData.props?.pageProps || {};
+        // 递归查找包含商品的数组
+        const findProducts = (obj, depth = 0) => {
+          if (depth > 6 || !obj || typeof obj !== 'object') return null;
+          if (Array.isArray(obj) && obj.length > 0 && obj[0] && (obj[0].skuNo || obj[0].productNo || obj[0].productName || obj[0].spuNo)) {
+            return obj;
+          }
+          for (const k of Object.keys(obj)) {
+            if (Array.isArray(obj[k]) && obj[k].length > 0) {
+              if (obj[k][0] && (obj[k][0].skuNo || obj[k][0].productNo || obj[k][0].productName || obj[k][0].spuNo)) {
+                return obj[k];
+              }
+            }
+            if (typeof obj[k] === 'object' && !Array.isArray(obj[k])) {
+              const found = findProducts(obj[k], depth + 1);
+              if (found) return found;
+            }
+          }
+          return null;
+        };
+        const productList = findProducts(pageProps);
+        if (productList && productList.length) {
+          productList.forEach(item => {
+            const sku = item.skuNo || item.productNo || item.spuNo || item.id;
+            if (!sku) return;
+            addProduct({
+              sku_no: String(sku),
+              title: stripHtml(item.productName || item.title || item.name || ''),
+              sub_title: stripHtml(item.subTitle || item.subtitle || ''),
+              brand: stripHtml(item.brand || item.brandName || ''),
+              model: stripHtml(item.model || item.modelNo || ''),
+              price: item.price || item.salePrice || item.displayPrice || null,
+              price_unit: stripHtml(item.unit || item.priceUnit || ''),
+              image: item.mainPic || item.imageUrl || item.imgUrl || item.picUrl || '',
+              images: item.pics || item.images || (item.mainPic ? [item.mainPic] : []),
+              category: stripHtml(item.categoryName || item.category || ''),
+              min_order: item.minOrderQty || item.minOrder || 1,
+              stock: item.stock || item.stockQty || null,
+              url: `${ZKH_BASE}/item/${sku}.html`,
+            });
+          });
+        }
+      } catch {}
+    }
+
+    // 方案1.5: 从 window.__INITIAL_DATA__ 中提取（震坤行SSR初始数据）
+    if (products.length === 0) {
+      const initMatch = html.match(/window\.__INITIAL_DATA__\s*=\s*(\{[\s\S]*?\})\s*;\s*<\/script>/);
+      if (initMatch) {
+        try {
+          const initData = JSON.parse(initMatch[1]);
+          const findProducts = (obj, depth = 0) => {
+            if (depth > 6 || !obj || typeof obj !== 'object') return null;
+            if (Array.isArray(obj) && obj.length > 0 && obj[0] && (obj[0].skuNo || obj[0].productNo || obj[0].productName || obj[0].spuNo)) {
+              return obj;
+            }
+            for (const k of Object.keys(obj)) {
+              if (Array.isArray(obj[k]) && obj[k].length > 0) {
+                if (obj[k][0] && (obj[k][0].skuNo || obj[k][0].productNo || obj[k][0].productName || obj[k][0].spuNo)) {
+                  return obj[k];
+                }
+              }
+              if (typeof obj[k] === 'object' && !Array.isArray(obj[k])) {
+                const found = findProducts(obj[k], depth + 1);
+                if (found) return found;
+              }
+            }
+            return null;
+          };
+          const productList = findProducts(initData);
+          if (productList && productList.length) {
+            productList.forEach(item => {
+              const sku = item.skuNo || item.productNo || item.spuNo || item.id;
+              if (!sku) return;
+              addProduct({
+                sku_no: String(sku),
+                title: stripHtml(item.productName || item.title || item.name || ''),
+                sub_title: stripHtml(item.subTitle || item.subtitle || ''),
+                brand: stripHtml(item.brand || item.brandName || ''),
+                model: stripHtml(item.model || item.modelNo || ''),
+                price: item.price || item.salePrice || item.displayPrice || null,
+                price_unit: stripHtml(item.unit || item.priceUnit || ''),
+                image: item.mainPic || item.imageUrl || item.imgUrl || item.picUrl || '',
+                images: item.pics || item.images || (item.mainPic ? [item.mainPic] : []),
+                category: stripHtml(item.categoryName || item.category || ''),
+                min_order: item.minOrderQty || item.minOrder || 1,
+                stock: item.stock || item.stockQty || null,
+                url: `${ZKH_BASE}/item/${sku}.html`,
+              });
+            });
+          }
+        } catch {}
+      }
+    }
+
+    // 方案2: 从 __next_f.push 数据中提取（Next.js App Router RSC格式）
+    if (products.length === 0) {
+      const allScriptText = $('script').map((_, s) => $(s).text() || '').get().join('\n');
+      // 匹配包含 skuNo 的 JSON 片段
+      const skuJsonPattern = /\{[^{}]*"skuNo"\s*:\s*"([^"]+)"[^{}]*\}/g;
+      let match;
+      while ((match = skuJsonPattern.exec(allScriptText)) !== null) {
+        try {
+          const obj = JSON.parse(match[0]);
+          const sku = obj.skuNo || obj.productNo;
+          if (sku) addProduct({
+            sku_no: String(sku),
+            title: stripHtml(obj.productName || obj.title || ''),
+            brand: stripHtml(obj.brand || obj.brandName || ''),
+            price: obj.price || obj.salePrice || null,
+            image: obj.mainPic || obj.imageUrl || '',
+            url: `${ZKH_BASE}/item/${sku}.html`,
+          });
+        } catch {}
+      }
+      // 也尝试匹配 productNo
+      const pnoJsonPattern = /\{[^{}]*"productNo"\s*:\s*"([^"]+)"[^{}]*\}/g;
+      while ((match = pnoJsonPattern.exec(allScriptText)) !== null) {
+        try {
+          const obj = JSON.parse(match[0]);
+          const sku = obj.productNo || obj.skuNo;
+          if (sku) addProduct({
+            sku_no: String(sku),
+            title: stripHtml(obj.productName || obj.title || ''),
+            price: obj.price || obj.salePrice || null,
+            url: `${ZKH_BASE}/item/${sku}.html`,
+          });
+        } catch {}
+      }
+    }
+
+    // 方案3: 从 DOM 中解析商品卡片
+    if (products.length === 0) {
+      $('a[href*="/item/"]').each((_, a) => {
+        const href = $(a).attr('href') || '';
+        const m = href.match(/\/item\/([A-Za-z0-9]+)\.html/);
+        if (!m) return;
+        const sku = m[1];
+        if (seenSkus.has(sku)) return;
+        // 从链接的祖先元素中提取信息
+        const $card = $(a).closest('li, div[class*="product"], div[class*="card"], div[class*="item"], div[class*="sku"], article');
+        const title = ($(a).attr('title') || $(a).text() || $card.find('[class*="title"], h3, h4, h5').first().text() || '').trim();
+        const priceText = $card.find('[class*="price"], [class*="Price"]').first().text() || '';
+        const priceMatch = priceText.match(/[\d,]+\.?\d*/);
+        const img = $card.find('img').first();
+        addProduct({
+          sku_no: sku,
+          title: stripHtml(title).substring(0, 200),
+          price: priceMatch ? parseFloat(priceMatch[0].replace(/,/g, '')) : null,
+          price_unit: '',
+          image: img.attr('src') || img.attr('data-src') || '',
+          images: [],
+          url: href.startsWith('http') ? href : ZKH_BASE + href,
+        });
       });
-    });
+    }
+
+    // 方案4: 从页面文本/HTML中正则提取所有SKU编号
+    if (products.length === 0) {
+      const skuMatches = [...html.matchAll(/\/item\/([A-Z]{1,5}\d{3,})\.html/g)];
+      for (const m of skuMatches) {
+        addProduct({
+          sku_no: m[1],
+          title: '',
+          price: null,
+          image: '',
+          url: `${ZKH_BASE}/item/${m[1]}.html`,
+        });
+      }
+    }
+
     if (products.length === 0) return { success: false, error: 'html parse empty', proxy };
+
     return {
       success: true,
-      data: { keyword, page: Number(page), page_size: Number(pageSize), total: products.length, total_pages: 1, products },
+      data: {
+        keyword,
+        page: Number(page),
+        page_size: Number(pageSize),
+        total: products.length,
+        total_pages: Math.ceil(products.length / Number(pageSize)) || 1,
+        products: products.slice(0, Number(pageSize)),
+      },
       proxy,
     };
   } catch (e) {
@@ -337,6 +523,10 @@ async function getProductDetail(skuNo) {
 
 function parseDetailFromHtml(html, skuNo) {
   try {
+    // WAF拦截检测
+    if (isWafBlocked(html)) return null;
+    // 登录重定向检测
+    if (isLoginRedirect(html)) return null;
     const $ = cheerio.load(html || '');
     const title = $('title').text().split('【')[0].split(/[|_-]/)[0].trim();
     const desc = $('meta[name="description"]').attr('content') || '';
@@ -402,7 +592,7 @@ function parseDetailFromHtml(html, skuNo) {
     untaxed = extractAnchoredPrice('未税价格');
     member = extractAnchoredPrice('会员价');
     // 提取单位（"/ 卷" "/ 米" 之类）
-    const unitMatch = text.match(/官网价[^\n\/]{0,60}\/\s*([\u4e00-\u9fa5A-Za-z]{1,8})/m);
+    const unitMatch = text.match(/官网价[^\\n\/]{0,60}\/\s*([\u4e00-\u9fa5A-Za-z]{1,8})/m);
     if (unitMatch) priceUnit = unitMatch[1].trim();
 
     const mainImage = images[0] || '';
