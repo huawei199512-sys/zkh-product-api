@@ -220,31 +220,19 @@ class ProxyManager {
       let all = [];
       results.forEach(r => { if (r.status === 'fulfilled') all.push(...r.value); });
       all = [...new Set(all)]; // 去重
-      // 验证代理（快速校验，避免全部验证太慢）
-      const validProxies = this.knownGoodProxies.slice();
-      const candidates = all.filter(p => !validProxies.includes(p));
-      // 最多取前60个快速筛选
-      const toTest = candidates.slice(0, 60);
-      const testResults = await Promise.allSettled(toTest.map(async p => {
-        try {
-          const cfg = this.createAxiosProxyConfig(p);
-          const resp = await axios.get('https://httpbin.org/ip', {
-            ...cfg, timeout: 5000,
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-          });
-          if (resp.data && resp.data.origin) return p;
-          throw new Error('no');
-        } catch { throw new Error('bad'); }
-      }));
-      testResults.forEach((r, i) => {
-        if (r.status === 'fulfilled') validProxies.push(toTest[i]);
-      });
+      // 策略：跳过预验证，直接使用获取到的代理列表
+      // 验证交给实际请求中的 markBad() 来处理，大幅缩短初始化时间
+      const validProxies = [...this.knownGoodProxies];
+      if (all.length > 0) {
+        // 最多保留100个代理
+        validProxies.push(...all.slice(0, 100));
+      }
       const final = [...new Set(validProxies)].filter(Boolean);
       if (final.length > 0) {
         this.proxies = final;
         this.usedCount.clear();
         this.proxyIndex = 0;
-        console.log('[Proxy] 代理池刷新完成，可用代理数:', final.length);
+        console.log('[Proxy] 代理池刷新完成，可用代理数:', final.length, '(含预验证0，实际请求中验证)');
       } else {
         console.warn('[Proxy] 本次无有效代理，使用现有代理继续尝试');
       }
