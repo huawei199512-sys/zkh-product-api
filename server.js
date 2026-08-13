@@ -106,6 +106,14 @@ app.post('/api/proxy/refresh', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+app.get('/api/proxy/refresh', async (req, res) => {
+  try {
+    await proxyManager.refreshProxies(true);
+    res.json({ success: true, ...proxyManager.getStatus() });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 // ============ 兜底路由 ============
 app.use((req, res) => {
