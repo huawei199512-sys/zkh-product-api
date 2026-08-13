@@ -1,0 +1,154 @@
+// 震坤行(zkh.com)商品详情和关键字搜索API - 无登录 + 强制免费代理IP池
+// 参考1688 API架构（huawei199512-sys/api_1688）重新实现
+const express = require('express');
+const cors = require('cors');
+const scraperZKH = require('./scraperZKH');
+const proxyManager = require('./proxyManager');
+
+const app = express();
+const PORT = process.env.PORT || 8000;
+
+app.use(cors());
+app.use(express.json());
+
+// ============ 全局错误防护 ============
+process.on('uncaughtException', (err) => {
+  console.error('[UncaughtException]', err.message);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[UnhandledRejection]', err && err.message ? err.message : err);
+});
+
+// ============ 健康检查端点（Render必需）============
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ============ 首页 - API说明 ============
+app.get('/', (req, res) => {
+  res.json({
+    service: '震坤行 ZKH Product API',
+    version: '1.0.0',
+    description: '震坤行(zkh.com)商品详情和关键字搜索API - 无登录 + 免费代理IP池方案',
+    mode: '无登录 + 强制免费代理IP + H5页面解析兜底',
+    features: {
+      login_required: false,
+      proxy_mode: '强制代理模式 - 13源自动刷新代理池（与1688/Amazon方案一致）',
+      protocols_supported: ['HTTP', 'HTTPS', 'SOCKS4', 'SOCKS5'],
+      detail_source: '/servezkhApi/goods/* 系列接口聚合 + /item H5页面解析兜底',
+      search_source: '/servezkhApi/search/product/pc API + 搜索页H5兜底',
+      strategy: '3代理并发竞态 × 最多8轮 → 成功立即返回，每2轮自动刷新代理池',
+      proxy_pool: '13源自动刷新代理池（每30分钟后台刷新，每次最小5分钟间隔）',
+      free_proxy_only: true,
+    },
+    endpoints: {
+      search: 'GET /api/search?q=关键词&page=1&pageSize=40',
+      detail: 'GET /api/detail/:skuNo',
+      proxy_status: 'GET /api/proxy/status',
+      proxy_refresh: 'POST /api/proxy/refresh',
+    },
+    examples: {
+      search: 'GET /api/search?q=手套&page=1&pageSize=40',
+      detail: 'GET /api/detail/KG2089',
+    },
+    proxy_status: proxyManager.getStatus(),
+  });
+});
+
+// ============ 搜索商品 ============
+app.get('/api/search', async (req, res) => {
+  try {
+    const { q, keyword, page = 1, pageSize = 40 } = req.query;
+    const kw = q || keyword;
+    if (!kw) {
+      return res.status(400).json({ success: false, error: 'q或keyword参数必填' });
+    }
+    proxyManager.setEnabled(true);
+    const result = await scraperZKH.searchProducts(String(kw), parseInt(page), parseInt(pageSize));
+    res.json(result);
+  } catch (error) {
+    console.error('[Search] error:', error);
+    res.status(500).json({ success: false, error: error.message || '搜索异常' });
+  }
+});
+
+// ============ 商品详情 ============
+app.get('/api/detail/:skuNo', async (req, res) => {
+  try {
+    const { skuNo } = req.params;
+    if (!skuNo) {
+      return res.status(400).json({ success: false, error: 'skuNo参数必填' });
+    }
+    proxyManager.setEnabled(true);
+    const result = await scraperZKH.getProductDetail(String(skuNo).toUpperCase());
+    res.json(result);
+  } catch (error) {
+    console.error('[Detail] error:', error);
+    res.status(500).json({ success: false, error: error.message || '详情异常' });
+  }
+});
+
+// ============ 代理状态 ============
+app.get('/api/proxy/status', (req, res) => {
+  res.json(proxyManager.getStatus());
+});
+
+// ============ 手动刷新代理池 ============
+app.post('/api/proxy/refresh', async (req, res) => {
+  try {
+    await proxyManager.refreshProxies(true);
+    res.json({ success: true, ...proxyManager.getStatus() });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============ 兜底路由 ============
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: `路径不存在: ${req.method} ${req.path}`,
+    available_endpoints: [
+      'GET /',
+      'GET /health',
+      'GET /api/search?q=xxx&page=1&pageSize=40',
+      'GET /api/detail/:skuNo',
+      'GET /api/proxy/status',
+      'POST /api/proxy/refresh',
+    ],
+  });
+});
+
+// ============ 先启动服务，再后台初始化代理池（Render健康检查优先）============
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('========================================');
+  console.log('  震坤行 ZKH Product API 已启动');
+  console.log('  监听端口: ' + PORT);
+  console.log('  模式: 无登录 + 强制免费代理IP');
+  console.log('========================================');
+  // 服务启动后，后台静默初始化代理池
+  setTimeout(async () => {
+    try {
+      console.log('[Init] 后台初始化代理池...');
+      await proxyManager.refreshProxies(true);
+      console.log('[Init] 代理池初始化完成:', proxyManager.getStatus());
+    } catch (e) {
+      console.warn('[Init] 代理池初始化失败（请求时会重试）:', e.message);
+    }
+  }, 1000);
+  // 启动自动刷新
+  proxyManager.startAutoRefresh();
+});
+
+// ============ Render免费版5分钟定时刷新代理池 ============
+setInterval(async () => {
+  try {
+    await proxyManager.refreshProxies(false);
+  } catch (e) {
+    console.warn('[AutoRefresh] 代理刷新异常:', e.message);
+  }
+}, 5 * 60 * 1000);
