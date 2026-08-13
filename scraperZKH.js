@@ -31,9 +31,9 @@ const DESKTOP_UAS = [
 
 // ============ 按经验 1387200：双层超时策略 ============
 const SINGLE_PROXY_TIMEOUT = 10000;  // 单代理 10s 必须切换（连接+TLS）
-const TOTAL_REQUEST_TIMEOUT = 30000; // 单次用户请求 30s 绝对截止
-const CONCURRENT_PROXIES = 3;
-const MAX_ROUNDS = 8;
+const TOTAL_REQUEST_TIMEOUT = 60000; // 单次用户请求 60s 绝对截止（给更多轮次机会）
+const CONCURRENT_PROXIES = 5;
+const MAX_ROUNDS = 10;
 
 function randomUA() { return DESKTOP_UAS[Math.floor(Math.random() * DESKTOP_UAS.length)]; }
 function generateTraceId() {
@@ -56,6 +56,15 @@ async function requestWithProxy({ method = 'GET', url, headers = {}, params = {}
     'User-Agent': randomUA(),
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Sec-Ch-Ua': '"Chromium";v="127", "Not)A;Brand";v="99"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'same-origin',
+    'Upgrade-Insecure-Requests': '1',
     'Referer': ZKH_BASE + '/',
     'Origin': ZKH_BASE,
     ...headers,
@@ -592,7 +601,7 @@ function parseDetailFromHtml(html, skuNo) {
     untaxed = extractAnchoredPrice('未税价格');
     member = extractAnchoredPrice('会员价');
     // 提取单位（"/ 卷" "/ 米" 之类）
-    const unitMatch = text.match(/官网价[^\\n\/]{0,60}\/\s*([\u4e00-\u9fa5A-Za-z]{1,8})/m);
+    const unitMatch = text.match(/官网价[^\n\/]{0,60}\/\s*([\u4e00-\u9fa5A-Za-z]{1,8})/m);
     if (unitMatch) priceUnit = unitMatch[1].trim();
 
     const mainImage = images[0] || '';
