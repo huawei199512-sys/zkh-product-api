@@ -83,8 +83,14 @@ function injectBrowserCookieIntoJar() {
 function getCookieStatus() {
   try {
     const all = globalCookieJar.getCookiesSync(ZKH_BASE);
-    return { jar_count: all.length, names: all.map(c => c.key) };
-  } catch { return { jar_count: 0, names: [] }; }
+    return {
+      jar_count: all.length,
+      names: all.map(c => c.key),
+      session_initialized: sessionInitialized,
+      env_cookie_detected: !!USER_COOKIE_FROM_BROWSER,
+      env_cookie_length: USER_COOKIE_FROM_BROWSER.length,
+    };
+  } catch { return { jar_count: 0, names: [], session_initialized: false, env_cookie_detected: !!USER_COOKIE_FROM_BROWSER }; }
 }
 
 function randomUA() { return DESKTOP_UAS[Math.floor(Math.random() * DESKTOP_UAS.length)]; }
@@ -290,12 +296,17 @@ async function searchProducts(keyword, page = 1, pageSize = 40) {
       return { success: false, error: 'api parse error: ' + e.message, proxy };
     }
   });
-  // 代理方式失败，尝试直接请求兜底（不走代理，增加浏览器header模拟）
+  // 代理方式失败，尝试直接请求兜底（不走代理，但带CookieJar + 浏览器header模拟）
   if (!result || !result.success) {
-    console.log('[Search] 代理方式失败(' + (result?.rounds || 0) + '轮)，尝试直接请求...');
+    console.log('[Search] 代理方式失败(' + (result?.rounds || 0) + '轮)，尝试直接请求(带Cookie)...');
     try {
+      // 确保Cookie已注入（如果环境变量有配置的话）
+      await ensureSession(null);
+      const cookieSt = getCookieStatus();
+      console.log('[Search] 直接请求时CookieJar状态:', cookieSt.jar_count, '个Cookie');
+
       const searchPageUrl = `${ZKH_BASE}/search.html?keywords=${encodeURIComponent(keyword)}&hasLinkWord=`;
-      const directResp = await axios.get(searchPageUrl, {
+      const directResp = await cookieAxios.get(searchPageUrl, {
         timeout: 20000,
         headers: {
           'User-Agent': randomUA(),
@@ -313,6 +324,8 @@ async function searchProducts(keyword, page = 1, pageSize = 40) {
         },
         responseType: 'text',
         maxRedirects: 5,
+        withCredentials: true,
+        jar: globalCookieJar,
       });
       const directParsed = tryParseSearchFromHtml(directResp.data, keyword, page, pageSize, 'direct');
       if (directParsed && directParsed.success) {
@@ -663,12 +676,17 @@ async function getProductDetail(skuNo) {
     return { success: true, data: merged, proxy };
   });
 
-  // 代理方式失败，尝试直接请求兜底
+  // 代理方式失败，尝试直接请求兜底（带CookieJar）
   if (!result || !result.success) {
-    console.log('[Detail] 代理方式失败(' + (result?.rounds || 0) + '轮)，尝试直接请求... SKU=' + skuNo);
+    console.log('[Detail] 代理方式失败(' + (result?.rounds || 0) + '轮)，尝试直接请求(带Cookie)... SKU=' + skuNo);
     try {
+      // 确保Cookie已注入
+      await ensureSession(null);
+      const cookieSt = getCookieStatus();
+      console.log('[Detail] 直接请求时CookieJar状态:', cookieSt.jar_count, '个Cookie');
+
       const detailPageUrl = `${ZKH_BASE}/item/${skuNo}.html`;
-      const directResp = await axios.get(detailPageUrl, {
+      const directResp = await cookieAxios.get(detailPageUrl, {
         timeout: 20000,
         headers: {
           'User-Agent': randomUA(),
@@ -686,15 +704,18 @@ async function getProductDetail(skuNo) {
         },
         responseType: 'text',
         maxRedirects: 5,
+        withCredentials: true,
+        jar: globalCookieJar,
       });
       const pageParse = parseDetailFromHtml(directResp.data, skuNo);
       if (pageParse) {
-        // 尝试直接调用详情API补充数据
+        // 尝试直接调用详情API补充数据（也带Cookie）
         const apiHeaders = { 'Content-Type': 'application/json;charset=UTF-8', 'Referer': detailPageUrl };
         let couponsRaw = null;
         try {
-          const cResp = await axios.get(`${ZKH_API_BASE}/goods/1/coupons/${skuNo}`, {
+          const cResp = await cookieAxios.get(`${ZKH_API_BASE}/goods/1/coupons/${skuNo}`, {
             params: { detailType: 2 }, headers: apiHeaders, timeout: 10000, responseType: 'text',
+            withCredentials: true, jar: globalCookieJar,
           });
           couponsRaw = typeof cResp.data === 'string' ? JSON.parse(cResp.data) : cResp.data;
         } catch {}
