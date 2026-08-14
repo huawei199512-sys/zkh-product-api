@@ -1,282 +1,274 @@
+// 震坤行(zkh.com)爬虫服务 - web.zkh360.com POST API + 分类列表页 + 代理池兜底
+//
+// 架构（按优先级）：
+//   1. web.zkh360.com POST API（推荐）：旧域名无WAF，直接返回JSON商品数据
+//   2. 分类列表页解析：www.zkh.com/list/c-XXX.html 无WAF，解析__NEXT_DATA__
+//   3. CF Worker 反代：利用 CF 全球边缘 IP 规避 WAF
+//   4. 免费代理池：多代理并发竞态 + 多轮重试
+//   5. 直连兜底
+//
+// 完全不依赖 Cookie、不需要过滑块、不需要 Chromium、不需要手动操作
 const axios = require('axios');
 const cheerio = require('cheerio');
-const crypto = require('crypto');
-const fs = require('fs');
-const { CookieJar } = require('tough-cookie');
-const { wrapper } = require('axios-cookiejar-support');
 const proxyManager = require('./proxyManager');
 
+// ============ 配置 ============
 const ZKH_BASE = 'https://www.zkh.com';
-const ZKH_API_BASE = 'https://www.zkh.com/servezkhApi';
-const ZKH_AUTH_BASE = 'https://www.zkh.com/zkhweb/zkhAuth';
+const ZKH360_API = 'https://web.zkh360.com';
+const ZKH360_SEARCH_API = ZKH360_API + '/api/search/listProductInfo';
+
+const CF_WORKER_URL = (process.env.CF_WORKER_URL || '').replace(/\/$/, '');
+const CF_WORKER_SECRET = process.env.CF_WORKER_SECRET || '';
+const USE_PROXY = process.env.USE_PROXY !== 'false';
 
 const DESKTOP_UAS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
 ];
 
-const SINGLE_PROXY_TIMEOUT = 10000;
-const TOTAL_REQUEST_TIMEOUT = 60000;
-const CONCURRENT_PROXIES = 5;
-const MAX_ROUNDS = 10;
-
-let globalCookieJar = new CookieJar();
-let cookieAxios = wrapper(axios.create({ jar: globalCookieJar, withCredentials: true }));
-
-let dynamicCookieString = '';
-const COOKIE_FILE_PATH = require('path').join(__dirname, 'cookies.json');
-try {
-  if (fs.existsSync(COOKIE_FILE_PATH)) {
-    const data = JSON.parse(fs.readFileSync(COOKIE_FILE_PATH, 'utf8'));
-    if (data.cookie_string) {
-      dynamicCookieString = data.cookie_string;
-      console.log(`[Cookie] 从 cookies.json 加载了 ${data.cookies?.length || 0} 个 Cookie`);
-    }
-  }
-} catch (e) {
-  console.warn('[Cookie] 读取 cookies.json 失败:', e.message);
-}
-
-const USER_COOKIE_FROM_BROWSER = process.env.ZKH_COOKIE_FROM_BROWSER || dynamicCookieString || '';
-let sessionInitialized = false;
-
-function injectBrowserCookieIntoJar() {
-  if (!USER_COOKIE_FROM_BROWSER) return { ok: false, count: 0 };
-  try {
-    let count = 0;
-    const cookies = USER_COOKIE_FROM_BROWSER.split(';').filter(Boolean);
-    for (const raw of cookies) {
-      const idx = raw.indexOf('=');
-      if (idx === -1) continue;
-      const name = raw.slice(0, idx).trim();
-      const value = raw.slice(idx + 1).trim();
-      if (!name) continue;
-      try { globalCookieJar.setCookieSync(`${name}=${value}`, ZKH_BASE); count++; } catch {}
-    }
-    console.log(`[Cookie] 已注入 ${count} 个浏览器 Cookie`);
-    return { ok: true, count };
-  } catch (e) {
-    return { ok: false, count: 0, error: e.message };
-  }
-}
-
-function getCookieStatus() {
-  try {
-    const all = globalCookieJar.getCookiesSync(ZKH_BASE);
-    return { jar_count: all.length, names: all.map(c => c.key), session_initialized: sessionInitialized, env_cookie_detected: !!USER_COOKIE_FROM_BROWSER, env_cookie_length: USER_COOKIE_FROM_BROWSER.length, cookie_source: dynamicCookieString ? 'cookies.json' : (process.env.ZKH_COOKIE_FROM_BROWSER ? 'env' : 'none') };
-  } catch { return { jar_count: 0, names: [], session_initialized: false }; }
-}
+const SINGLE_TIMEOUT = 12000;
+const TOTAL_TIMEOUT = 45000;
+const CONCURRENT = 3;
+const MAX_ROUNDS = 6;
 
 function randomUA() { return DESKTOP_UAS[Math.floor(Math.random() * DESKTOP_UAS.length)]; }
-function generateTraceId() { return `${Date.now()}${Math.floor(Math.random()*1e12).toString().padStart(12,'0')}${Math.floor(Math.random()*10)}`; }
 
-function isSevereProxyError(msgOrCode) {
-  if (!msgOrCode) return false;
-  return /CERT|TLS|SSL|403|407|405|PROXY_AUTH|ECONNREFUSED|HANDSHAKE|UNABLE_TO_VERIFY|CERT_HAS_EXPIRED/.test(String(msgOrCode).toUpperCase());
+function buildHeaders(referer) {
+  return {
+    'User-Agent': randomUA(),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/apng,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    'Sec-Ch-Ua': '"Chromium";v="127", "Not)A;Brand";v="99"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
+    'Referer': referer || (ZKH_BASE + '/'),
+  };
 }
 
-async function ensureSession(proxy = null) {
-  if (sessionInitialized) return { ok: true, source: 'cached' };
+async function fetchViaCFWorker(targetPath, search) {
+  if (!CF_WORKER_URL) return { success: false, error: 'CF_WORKER_URL not configured' };
+  const url = CF_WORKER_URL + targetPath + (search || '');
+  const headers = { 'Accept': 'text/html,application/xhtml+xml,*/*' };
+  if (CF_WORKER_SECRET) headers['X-Proxy-Secret'] = CF_WORKER_SECRET;
   try {
-    const injected = injectBrowserCookieIntoJar();
-    if (injected.ok && injected.count > 0) {
-      sessionInitialized = true;
-      return { ok: true, source: 'inject', count: injected.count };
-    }
-    const r = await requestWithProxyRaw({ method: 'GET', url: ZKH_BASE + '/', headers: { 'Accept': 'text/html' }, proxy, extraSessionInit: true });
-    if (r.success) {
-      sessionInitialized = true;
-      return { ok: true, source: 'homepage' };
-    }
-    return { ok: false, error: r.error };
-  } catch (e) { return { ok: false, error: e.message }; }
+    const resp = await axios.get(url, { headers, timeout: SINGLE_TIMEOUT, responseType: 'text', maxRedirects: 3 });
+    if (resp.status === 200 && resp.data && !isWafPage(resp.data)) return { success: true, data: resp.data, source: 'cf-worker' };
+    return { success: false, error: `cf-worker status=${resp.status} waf=${isWafPage(resp.data)}` };
+  } catch (e) { return { success: false, error: 'cf-worker: ' + (e.code || e.message) }; }
 }
 
-async function requestWithProxyRaw({ method = 'GET', url, headers = {}, params = {}, data = null, proxy = null, extraSessionInit = false }) {
-  const allHeaders = { 'User-Agent': randomUA(), 'Accept': 'application/json, text/plain, */*', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8', 'Accept-Encoding': 'gzip, deflate, br', 'Connection': 'keep-alive', 'Referer': ZKH_BASE + '/', ...headers };
-  const proxyCfg = proxyManager.createAxiosProxyConfig(proxy);
-  const controller = new AbortController();
-  const timeoutTimer = setTimeout(() => controller.abort(), SINGLE_PROXY_TIMEOUT);
-  try {
-    const axiosArgs = { method, url, params: { ...params, traceId: params?.traceId || generateTraceId() }, headers: allHeaders, signal: controller.signal, timeout: SINGLE_PROXY_TIMEOUT, responseType: 'text', withCredentials: true, jar: globalCookieJar, ...proxyCfg };
-    let resp;
-    if (method.toUpperCase() === 'GET' || method.toUpperCase() === 'DELETE') { resp = await cookieAxios(axiosArgs); }
-    else { resp = await cookieAxios({ ...axiosArgs, data }); }
-    clearTimeout(timeoutTimer);
-    return { success: true, data: resp.data, status: resp.status, proxy };
-  } catch (err) {
-    clearTimeout(timeoutTimer);
-    proxyManager.markBad(proxy, isSevereProxyError(err.code || err.message));
-    return { success: false, error: err.code || err.message, proxy };
-  }
-}
-
-async function requestWithProxy({ method = 'GET', url, headers = {}, params = {}, data = null, proxy = null }) {
-  await ensureSession(proxy);
-  return await requestWithProxyRaw({ method, url, headers, params, data, proxy });
-}
-
-async function raceConcurrent(taskFn, count = CONCURRENT_PROXIES) {
+async function fetchViaProxy(targetPath, search, referer) {
+  const targetUrl = ZKH_BASE + targetPath + (search || '');
+  const headers = buildHeaders(referer);
   const promises = [];
-  for (let i = 0; i < count; i++) { const proxy = proxyManager.getNextProxy(); promises.push((async () => { try { return await taskFn(proxy); } catch (e) { return { success: false, error: e.message, proxy }; } })()); }
-  const results = await Promise.allSettled(promises);
-  const succ = results.find(r => r.status === 'fulfilled' && r.value?.success);
-  if (succ) { proxyManager.markGood(succ.value.proxy); return succ.value; }
-  const fail = results.find(r => r.status === 'fulfilled');
-  return fail ? fail.value : { success: false, error: 'all failed' };
-}
-
-async function multiRoundRun(taskFn, roundCount = MAX_ROUNDS, concurrent = CONCURRENT_PROXIES) {
-  const deadline = Date.now() + TOTAL_REQUEST_TIMEOUT;
-  const errors = [];
-  for (let round = 0; round < roundCount; round++) {
-    if (Date.now() >= deadline) break;
-    const res = await raceConcurrent(taskFn, concurrent);
-    if (res?.success) return { ...res, rounds: round + 1, errors };
-    errors.push(`R${round}:${res?.error || 'na'}`);
-    if (round % 2 === 1) { try { await proxyManager.refreshProxies(false); } catch {} }
-    await new Promise(r => setTimeout(r, 300 + Math.random() * 500));
+  for (let i = 0; i < CONCURRENT; i++) {
+    const proxy = proxyManager.getNextProxy();
+    promises.push((async () => {
+      const proxyCfg = proxyManager.createAxiosProxyConfig(proxy);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), SINGLE_TIMEOUT);
+      try {
+        const resp = await axios.get(targetUrl, { headers, timeout: SINGLE_TIMEOUT, responseType: 'text', maxRedirects: 3, signal: controller.signal, ...proxyCfg });
+        clearTimeout(timer);
+        if (resp.status === 200 && resp.data && !isWafPage(resp.data)) { proxyManager.markGood(proxy); return { success: true, data: resp.data, source: 'proxy', proxy }; }
+        proxyManager.markBad(proxy, isWafPage(resp.data));
+        return { success: false, error: `proxy waf/bad-status`, proxy };
+      } catch (e) { clearTimeout(timer); const msg = e.code || e.message || 'unknown'; proxyManager.markBad(proxy, isSevereError(msg)); return { success: false, error: msg, proxy }; }
+    })());
   }
-  return { success: false, error: `多轮重试失败（共${roundCount}轮）`, rounds: roundCount, errors };
+  const results = await Promise.allSettled(promises);
+  const ok = results.find(r => r.status === 'fulfilled' && r.value && r.value.success);
+  return ok ? ok.value : { success: false, error: 'all proxies failed' };
 }
 
-function isWafBlocked(html) { return html?.includes('访问验证') || html?.includes('滑动验证') || html?.includes('请按住滑块') || html?.includes('请进行验证'); }
-function isLoginRedirect(html) { return html?.includes('passport.zkh.com') || html?.includes('请先登录'); }
+async function fetchDirect(targetPath, search, referer) {
+  const targetUrl = ZKH_BASE + targetPath + (search || '');
+  try {
+    const resp = await axios.get(targetUrl, { headers: buildHeaders(referer), timeout: SINGLE_TIMEOUT, responseType: 'text', maxRedirects: 3 });
+    if (resp.status === 200 && resp.data && !isWafPage(resp.data)) return { success: true, data: resp.data, source: 'direct' };
+    return { success: false, error: `direct status=${resp.status} waf=${isWafPage(resp.data)}` };
+  } catch (e) { return { success: false, error: 'direct: ' + (e.code || e.message) }; }
+}
+
+async function fetchZKHPage(targetPath, search, referer) {
+  const errors = [];
+  if (CF_WORKER_URL) {
+    const r = await fetchViaCFWorker(targetPath, search);
+    if (r.success) { console.log(`[Fetch] CF Worker 成功: ${targetPath}`); return r; }
+    errors.push('cf-worker: ' + r.error);
+  }
+  if (USE_PROXY && proxyManager.isEnabled()) {
+    const deadline = Date.now() + TOTAL_TIMEOUT;
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      if (Date.now() >= deadline) { errors.push('total_timeout'); break; }
+      const r = await fetchViaProxy(targetPath, search, referer);
+      if (r.success) { console.log(`[Fetch] 代理成功 (R${round + 1}): ${targetPath}`); return r; }
+      errors.push(`R${round + 1}:${r.error}`);
+      if (round % 2 === 1) { try { await proxyManager.refreshProxies(false); } catch {} }
+      await new Promise(r => setTimeout(r, 300 + Math.random() * 400));
+    }
+  }
+  const r = await fetchDirect(targetPath, search, referer);
+  if (r.success) { console.log(`[Fetch] 直连成功: ${targetPath}`); return r; }
+  errors.push('direct: ' + r.error);
+  return { success: false, error: errors.join(' | '), errors };
+}
+
+function isWafPage(html) {
+  if (!html || typeof html !== 'string') return false;
+  return html.includes('请按住滑块') || html.includes('访问验证') || html.includes('滑动验证') || html.includes('slider') && html.includes('verify');
+}
+function isSevereError(msg) {
+  const s = String(msg || '').toUpperCase();
+  return /CERT|TLS|SSL|403|407|ECONNREFUSED|HANDSHAKE/.test(s);
+}
+
+// ============ 请求方式0：web.zkh360.com POST API（最优，无WAF）============
+async function searchViaZKH360API(keyword, page = 1, pageSize = 40) {
+  const from = (Number(page) - 1) * Number(pageSize);
+  const body = { from, size: Number(pageSize), keyword: keyword || null, fz: false, catalogueId: null, productFilter: { brandIds: [], properties: {} }, cityCode: 310100, extraFilter: { showIndustryFeatured: false, inStock: false }, searchType: { notNeedCorrect: false }, clp: true };
+  try {
+    const resp = await axios.post(ZKH360_SEARCH_API, body, {
+      headers: { 'Content-Type': 'application/json', 'User-Agent': randomUA(), 'Accept': 'application/json', 'Origin': ZKH360_API, 'Referer': ZKH360_API + '/' },
+      timeout: 15000, maxRedirects: 3, validateStatus: () => true,
+    });
+    if (resp.status !== 200) return { success: false, error: `zkh360 API status=${resp.status}` };
+    const data = resp.data;
+    const pageData = data.page || data.data || data.result || data;
+    const list = pageData.content || pageData.list || pageData.products || pageData.records || [];
+    const total = pageData.total || pageData.totalCount || pageData.totalElements || list.length;
+    const totalPages = pageData.totalPages || pageData.totalPage || Math.ceil(total / pageSize) || 1;
+    if (!list || list.length === 0) return { success: false, error: 'zkh360 API returned empty list' };
+    const products = list.map(item => normalizeAPIProduct(item));
+    return { success: true, source: 'zkh360-api', data: { keyword, page: Number(page), page_size: Number(pageSize), total, total_pages: totalPages, products } };
+  } catch (e) { return { success: false, error: 'zkh360-api: ' + (e.code || e.message) }; }
+}
+
+function normalizeAPIProduct(item) {
+  const strip = (s) => (typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : (s ?? ''));
+  const sku = item.proSkuNo || item.skuNo || item.productNo || item.spuNo || item.id || '';
+  return {
+    sku_no: String(sku),
+    title: strip(item.proSkuProductName || item.productName || item.title || item.name || ''),
+    sub_title: strip(item.proSkuSubTitle || item.subTitle || ''),
+    brand: strip(item.proBrandName || item.brandName || item.brand || ''),
+    model: strip(item.proMaterialNo || item.modelNo || item.model || item.materialNo || ''),
+    price: parsePrice(item.price ?? item.salePrice ?? item.displayPrice ?? item.proPrice),
+    price_unit: strip(item.unitOfMeasureCode || item.unit || item.proUnit || ''),
+    image: fixUrl(item.mainPic || item.imageUrl || item.imgUrl || item.picUrl || item.proMainPic || ''),
+    images: (item.pics || item.images || item.imageList || item.proPics || []).map(fixUrl).filter(Boolean),
+    category: strip(item.catalogName || item.categoryName || item.category || ''),
+    min_order: item.minOrderQty || item.minOrder || item.proMinOrder || 1,
+    stock: item.stock ?? item.stockQty ?? item.proStock ?? null,
+    lead_time: strip(item.proSkuLeadTime || item.leadTime || item.deliveryTime || ''),
+    specs: extractSpecs(item.specificationList || item.specs || item.params || []),
+    url: sku ? `${ZKH_BASE}/item/${sku}.html` : '',
+  };
+}
+
+function extractSpecs(specList) {
+  const specs = {};
+  if (!Array.isArray(specList)) return specs;
+  specList.forEach(s => { const k = s.name || s.label || s.key || s.propertyName; const v = s.value || s.val || s.propertyValue; if (k && v != null) specs[k] = typeof v === 'string' ? v : JSON.stringify(v); });
+  return specs;
+}
 
 async function searchProducts(keyword, page = 1, pageSize = 40) {
-  const result = await multiRoundRun(async (proxy) => {
-    await requestWithProxy({ url: ZKH_BASE + '/', headers: { 'Accept': 'text/html' }, proxy });
-    const searchPageUrl = `${ZKH_BASE}/search.html?keywords=${encodeURIComponent(keyword)}&hasLinkWord=`;
-    const resp = await requestWithProxy({ url: searchPageUrl, headers: { 'Accept': 'text/html', 'Referer': ZKH_BASE + '/' }, proxy });
-    if (!resp.success) return resp;
-    const parsed = tryParseSearchFromHtml(resp.data, keyword, page, pageSize, proxy);
-    if (parsed?.success && parsed.data?.products?.length > 0) return parsed;
-    const apiResp = await requestWithProxy({ method: 'POST', url: `${ZKH_API_BASE}/search/product/pc`, data: { keyword, page: Number(page), pageSize: Number(pageSize), sort: '', order: '', filter: {}, areaCode: '' }, headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Referer': searchPageUrl }, proxy });
-    if (!apiResp.success) return apiResp;
-    try {
-      const j = typeof apiResp.data === 'string' ? JSON.parse(apiResp.data) : apiResp.data;
-      if ((j.success || j.code === '0000' || j.code === 200) && (j.result || j.data)) return { success: true, data: parseSearchResult(j.result || j.data, keyword, page, pageSize), proxy };
-      return { success: false, error: j.msg || j.message || 'code=' + j.code, proxy };
-    } catch (e) { return { success: false, error: 'api parse: ' + e.message, proxy }; }
-  });
-  if (!result?.success) {
-    try {
-      await ensureSession(null);
-      const directResp = await cookieAxios.get(`${ZKH_BASE}/search.html?keywords=${encodeURIComponent(keyword)}&hasLinkWord=`, { timeout: 20000, headers: { 'User-Agent': randomUA(), 'Accept': 'text/html' }, responseType: 'text', maxRedirects: 5, withCredentials: true, jar: globalCookieJar });
-      const dp = tryParseSearchFromHtml(directResp.data, keyword, page, pageSize, 'direct');
-      if (dp?.success) return formatSearchResult({ ...dp, rounds: 0 }, keyword, page, pageSize);
-    } catch (e) {}
-  }
-  return formatSearchResult(result, keyword, page, pageSize);
+  const apiResult = await searchViaZKH360API(keyword, page, pageSize);
+  if (apiResult.success) { console.log(`[Search] zkh360 API 成功: keyword=${keyword}, count=${apiResult.data.products.length}`); return formatSearchResult(apiResult, keyword, page, pageSize); }
+  console.log(`[Search] zkh360 API 失败: ${apiResult.error}，尝试HTML解析...`);
+  const searchPath = '/search.html';
+  const search = `?keywords=${encodeURIComponent(keyword)}&hasLinkWord=&page=${page}`;
+  const result = await fetchZKHPage(searchPath, search, ZKH_BASE + '/');
+  if (!result.success) return formatSearchResult(result, keyword, page, pageSize);
+  const parsed = parseSearchFromHtml(result.data, keyword, page, pageSize);
+  return formatSearchResult({ ...parsed, source: result.source }, keyword, page, pageSize);
 }
 
-function tryParseSearchFromHtml(html, keyword, page, pageSize, proxy) {
+function parseSearchFromHtml(html, keyword, page, pageSize) {
   try {
-    if (isWafBlocked(html)) return { success: false, error: 'WAF blocked', proxy };
-    if (isLoginRedirect(html)) return { success: false, error: 'login redirect', proxy };
+    if (isWafPage(html)) return { success: false, error: 'WAF blocked' };
     const $ = cheerio.load(html || '');
-    const stripHtml = (s) => typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : (s ?? '');
-    const products = [];
-    const seen = new Set();
-    const add = (p) => { if (p.sku_no && !seen.has(String(p.sku_no))) { seen.add(String(p.sku_no)); products.push(p); } };
-    const nextData = $('#__NEXT_DATA__').html();
-    if (nextData) {
-      try {
-        const findArr = (o, d=0) => { if (d>6||!o||typeof o!=='object') return null; if (Array.isArray(o)&&o[0]&&(o[0].skuNo||o[0].productNo||o[0].productName)) return o; for (const k of Object.keys(o)) { if (Array.isArray(o[k])&&o[k][0]&&(o[k][0].skuNo||o[k][0].productNo||o[k][0].productName)) return o[k]; if (typeof o[k]==='object') { const f=findArr(o[k],d+1); if(f) return f; } } return null; };
-        const arr = findArr(JSON.parse(nextData).props?.pageProps||{});
-        if (arr) arr.forEach(i => { const s=i.skuNo||i.productNo||i.spuNo; if(s) add({sku_no:String(s),title:stripHtml(i.productName||i.title||''),brand:stripHtml(i.brand||''),price:i.price||null,image:i.mainPic||'',url:`${ZKH_BASE}/item/${s}.html`}); });
-      } catch {}
-    }
-    if (!products.length) { $('a[href*="/item/"]').each((_,a) => { const m=($(a).attr('href')||'').match(/\/item\/([A-Za-z0-9]+)\.html/); if(m) add({sku_no:m[1],title:stripHtml($(a).text()).substring(0,200),url:`${ZKH_BASE}/item/${m[1]}.html`}); }); }
-    if (!products.length) { for (const m of html?.matchAll(/\/item\/([A-Z]{1,5}\d{3,})\.html/g)||[]) add({sku_no:m[1],title:'',url:`${ZKH_BASE}/item/${m[1]}.html`}); }
-    if (!products.length) return { success: false, error: 'parse empty', proxy };
-    return { success: true, data: { keyword, page: Number(page), page_size: Number(pageSize), total: products.length, total_pages: 1, products: products.slice(0, Number(pageSize)) }, proxy };
-  } catch (e) { return { success: false, error: 'parse: ' + e.message, proxy }; }
+    const stripHtml = (s) => (typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : (s ?? ''));
+    const products = []; const seen = new Set();
+    const add = (p) => { if (!p.sku_no || seen.has(String(p.sku_no))) return; seen.add(String(p.sku_no)); products.push(p); };
+    const nextScript = $('#__NEXT_DATA__').html();
+    if (nextScript) { try { const nd = JSON.parse(nextScript); const list = findProductArray(nd.props?.pageProps || nd); if (list && list.length) { list.forEach(item => { const sku = item.skuNo || item.productNo || item.spuNo || item.id; if (!sku) return; add({ sku_no: String(sku), title: stripHtml(item.productName || item.title || item.name || ''), brand: stripHtml(item.brand || item.brandName || ''), model: stripHtml(item.model || item.modelNo || ''), price: parsePrice(item.price ?? item.salePrice ?? item.displayPrice), image: fixUrl(item.mainPic || item.imageUrl || item.imgUrl || item.picUrl || ''), url: `${ZKH_BASE}/item/${sku}.html` }); }); } } catch {} }
+    if (products.length === 0) { $('a[href*="/item/"]').each((_, a) => { const href = $(a).attr('href') || ''; const mm = href.match(/\/item\/([A-Za-z0-9]+)\.html/); if (!mm) return; const sku = mm[1]; if (seen.has(sku)) return; const $card = $(a).closest('li, div[class*="product"], div[class*="card"], div[class*="item"]'); const title = ($(a).attr('title') || $(a).text() || '').trim(); const priceText = $card.find('[class*="price"], [class*="Price"]').first().text() || ''; const pm = priceText.match(/[\d,]+\.?\d*/); add({ sku_no: sku, title: stripHtml(title).substring(0, 200), price: pm ? parseFloat(pm[0].replace(/,/g, '')) : null, url: href.startsWith('http') ? href : ZKH_BASE + href }); }); }
+    if (products.length === 0) { const matches = [...html.matchAll(/\/item\/([A-Z]{1,5}\d{3,})\.html/g)]; matches.forEach(m => add({ sku_no: m[1], title: '', price: null, url: `${ZKH_BASE}/item/${m[1]}.html` })); }
+    if (products.length === 0) return { success: false, error: 'html parse empty' };
+    const start = (Number(page) - 1) * Number(pageSize);
+    return { success: true, data: { keyword, page: Number(page), page_size: Number(pageSize), total: products.length, total_pages: Math.ceil(products.length / Number(pageSize)) || 1, products: products.slice(start, start + Number(pageSize)) } };
+  } catch (e) { return { success: false, error: 'parse error: ' + e.message }; }
 }
 
-function parseSearchResult(raw, keyword, page, pageSize) {
-  const list = raw.list || raw.data?.list || raw.items || [];
-  const stripHtml = (s) => typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : (s ?? '');
-  return { keyword, page: Number(page), page_size: Number(pageSize), total: raw.total || list.length, total_pages: Math.ceil((raw.total||list.length)/Number(pageSize)), products: list.map(i => ({ sku_no: i.skuNo||i.productNo||i.id, title: stripHtml(i.productName||i.title||''), brand: stripHtml(i.brand||''), price: i.price||null, image: i.mainPic||'', url: i.skuNo?`${ZKH_BASE}/item/${i.skuNo}.html`:'' })) };
+function findProductArray(obj, depth = 0) {
+  if (depth > 6 || !obj || typeof obj !== 'object') return null;
+  if (Array.isArray(obj) && obj.length > 0 && obj[0] && (obj[0].skuNo || obj[0].productNo || obj[0].productName || obj[0].spuNo)) return obj;
+  for (const k of Object.keys(obj)) { if (Array.isArray(obj[k]) && obj[k].length > 0 && obj[k][0] && (obj[k][0].skuNo || obj[k][0].productNo || obj[k][0].productName || obj[k][0].spuNo)) return obj[k]; if (typeof obj[k] === 'object' && !Array.isArray(obj[k])) { const found = findProductArray(obj[k], depth + 1); if (found) return found; } }
+  return null;
 }
 
-function formatSearchResult(result, keyword, page, pageSize) {
-  if (!result?.success) return { success: false, error: result?.error||'搜索失败', keyword, page: Number(page), page_size: Number(pageSize), products: [] };
-  return { success: true, ...result.data };
-}
+function parsePrice(v) { if (v == null) return null; if (typeof v === 'number') return v; const m = String(v).match(/[\d,]+\.?\d*/); if (!m) return null; const n = parseFloat(m[0].replace(/,/g, '')); return (!isNaN(n) && n > 0 && n < 9999999) ? n : null; }
+function fixUrl(u) { if (!u || typeof u !== 'string') return ''; if (u.startsWith('http')) return u; if (u.startsWith('//')) return 'https:' + u; if (u.startsWith('/')) return ZKH_BASE + u; return u; }
+function formatSearchResult(result, keyword, page, pageSize) { if (!result || !result.success) return { success: false, error: (result && result.error) || '搜索失败', keyword, page: Number(page), page_size: Number(pageSize), products: [] }; return { success: true, source: result.source, ...result.data }; }
 
 async function getProductDetail(skuNo) {
-  const result = await multiRoundRun(async (proxy) => {
-    const detailPageUrl = `${ZKH_BASE}/item/${skuNo}.html`;
-    await requestWithProxy({ url: detailPageUrl, headers: { 'Accept': 'text/html' }, proxy });
-    const apiHeaders = { 'Content-Type': 'application/json;charset=UTF-8', 'Referer': detailPageUrl };
-    const settled = await Promise.allSettled([
-      requestWithProxy({ method: 'GET', url: `${ZKH_API_BASE}/goods/1/coupons/${skuNo}`, params: { detailType: 2 }, headers: apiHeaders, proxy }),
-      requestWithProxy({ method: 'GET', url: `${ZKH_API_BASE}/goods/tags/${skuNo}`, headers: apiHeaders, proxy }),
-      requestWithProxy({ method: 'POST', url: `${ZKH_API_BASE}/goods/1/selectSpec`, data: { skuNo }, headers: apiHeaders, proxy }),
-    ]);
-    const pj = (r) => { try { return typeof r === 'string' ? JSON.parse(r) : r; } catch { return null; } };
-    const couponsRaw = settled[0].status==='fulfilled'&&settled[0].value.success ? pj(settled[0].value.data) : null;
-    const specRaw = settled[2].status==='fulfilled'&&settled[2].value.success ? pj(settled[2].value.data) : null;
-    const pageResp = await requestWithProxy({ url: detailPageUrl, headers: { 'Accept': 'text/html' }, proxy });
-    const pageParse = pageResp.success ? parseDetailFromHtml(pageResp.data, skuNo) : null;
-    if (!pageParse && !couponsRaw && !specRaw) return { success: false, error: 'all invalid', proxy };
-    return { success: true, data: mergeDetailData({ skuNo, pageParse, couponsRaw, specRaw }), proxy };
-  });
-  if (!result?.success) {
-    try {
-      await ensureSession(null);
-      const directResp = await cookieAxios.get(`${ZKH_BASE}/item/${skuNo}.html`, { timeout: 20000, headers: { 'User-Agent': randomUA(), 'Accept': 'text/html' }, responseType: 'text', maxRedirects: 5, withCredentials: true, jar: globalCookieJar });
-      const pp = parseDetailFromHtml(directResp.data, skuNo);
-      if (pp) return { success: true, ...mergeDetailData({ skuNo, pageParse: pp, couponsRaw: null, specRaw: null }), rounds: 0 };
-    } catch (e) {}
+  const apiResult = await searchViaZKH360API(skuNo, 1, 10);
+  if (apiResult.success && apiResult.data && apiResult.data.products) {
+    const match = apiResult.data.products.find(p => p.sku_no && p.sku_no.toUpperCase() === skuNo.toUpperCase());
+    if (match) { console.log(`[Detail] zkh360 API 成功: sku=${skuNo}`); return { success: true, source: 'zkh360-api', sku_no: match.sku_no, title: match.title, description: match.sub_title || '', brand: match.brand, model: match.model, order_code: match.sku_no, min_order: match.min_order, unit: match.price_unit, price: match.price, price_unit: match.price_unit, currency: 'CNY', main_image: match.image, images: match.images && match.images.length ? match.images : (match.image ? [match.image] : []), specs: match.specs, stock: match.stock, lead_time: match.lead_time || '', category: match.category, url: match.url }; }
   }
-  if (!result?.success) return { success: false, error: result?.error||'详情获取失败', sku_no: skuNo };
-  return { success: true, ...result.data };
+  console.log(`[Detail] zkh360 API 未找到SKU=${skuNo}，尝试HTML详情页...`);
+  const result = await fetchZKHPage(`/item/${skuNo}.html`, '', ZKH_BASE + '/');
+  if (!result.success) return { success: false, error: result.error || '详情获取失败', sku_no: skuNo };
+  const parsed = parseDetailFromHtml(result.data, skuNo);
+  if (!parsed) return { success: false, error: '详情页解析失败', sku_no: skuNo };
+  return { success: true, source: result.source, ...parsed };
 }
 
 function parseDetailFromHtml(html, skuNo) {
   try {
-    if (isWafBlocked(html)||isLoginRedirect(html)) return null;
-    const $ = cheerio.load(html||'');
-    const title = $('title').text().split('【')[0].split(/[|_-]/)[0].trim();
-    const desc = $('meta[name="description"]').attr('content')||'';
+    if (isWafPage(html)) return null;
+    const $ = cheerio.load(html || '');
+    const stripHtml = (s) => (typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : (s ?? ''));
+    const text = $('body').text();
+    let detail = null;
+    const nextScript = $('#__NEXT_DATA__').html();
+    if (nextScript) { try { const nd = JSON.parse(nextScript); detail = findDetailObject(nd.props?.pageProps || nd, skuNo); } catch {} }
+    let title = detail?.productName || detail?.skuName || '';
+    if (!title) title = $('title').text().split('【')[0].split(/[|_-]/)[0].trim();
     const images = [];
-    $('img[src*="PRODUCT"]').each((_,img) => { const s=$(img).attr('src')||$(img).attr('data-src'); if(s) images.push(s); });
-    let mainTitle=''; $('h1,[class*="title"]').each((_,el) => { const t=$(el).text().trim(); if(t.length>5&&t.length<200&&!mainTitle) mainTitle=t; });
-    let price=null; $('[class*="[Pp]rice"]').each((_,el) => { const t=$(el).text().replace(/[^\d.]/g,''); if(t&&price===null) { const n=parseFloat(t); if(n>0&&n<999999) price=n; } });
-    const specs={}; const text=$('body').text();
-    ['品牌名称','商品型号','订货编码','包装规格','起订量','最小包装量','发货日','销售单位'].forEach(f => { const m=text.match(new RegExp(`${f}[\\s:：]*([^\\n\\r]{1,80}?)\\s*(?=(品牌名称|商品型号|订货编码|包装规格|起订量|最小包装量|发货日|销售单位|$)`,'m')); if(m?.[1]) specs[f]=m[1].trim().replace(/\s+/g,' ').slice(0,80); });
-    return { title: mainTitle||title, description: desc, images, main_image: images[0]||'', price, specs };
+    if (detail?.pics?.length) detail.pics.forEach(p => { const u = fixUrl(typeof p === 'string' ? p : p.url); if (u) images.push(u); });
+    if (images.length === 0) $('img[src*="private.zkh.com/PRODUCT"]').each((_, img) => { const src = fixUrl($(img).attr('src') || ''); if (src && !images.includes(src)) images.push(src); });
+    let price = parsePrice(detail?.price ?? detail?.salePrice);
+    if (!price) { const m = text.match(/官网价[^\d]{0,40}([￥¥]?\s*[\d,]+\.?\d*)/); if (m) price = parsePrice(m[1]); }
+    const specs = {};
+    if (detail?.params?.length) detail.params.forEach(p => { const k = p.name || p.label; const v = p.value || p.val; if (k && v != null) specs[k] = String(v); });
+    if (!title && images.length === 0 && Object.keys(specs).length === 0) return null;
+    return { sku_no: skuNo, title: stripHtml(title).substring(0, 200), brand: detail?.brand || '', model: detail?.model || '', price, main_image: images[0] || '', images, specs, url: `${ZKH_BASE}/item/${skuNo}.html` };
   } catch { return null; }
 }
 
-function mergeDetailData({ skuNo, pageParse, couponsRaw, specRaw }) {
-  const spec = specRaw?.result || specRaw?.data || {};
-  const coupons = couponsRaw?.result || couponsRaw?.data || {};
-  return {
-    sku_no: skuNo,
-    title: spec.productName || pageParse?.title || '',
-    brand: spec.brand || pageParse?.specs?.['品牌名称'] || '',
-    model: spec.model || pageParse?.specs?.['商品型号'] || '',
-    price: coupons.price || spec.price || pageParse?.price || null,
-    main_image: pageParse?.main_image || '',
-    images: pageParse?.images || [],
-    specs: { ...pageParse?.specs },
-    description: pageParse?.description || '',
-    url: `${ZKH_BASE}/item/${skuNo}.html`,
-  };
+function findDetailObject(obj, skuNo, depth = 0) {
+  if (depth > 8 || !obj || typeof obj !== 'object') return null;
+  if (obj.skuNo === skuNo || obj.productNo === skuNo) { if (obj.productName || obj.price != null || obj.pics) return obj; }
+  for (const k of Object.keys(obj)) { if (typeof obj[k] === 'object' && obj[k] !== null) { const found = findDetailObject(obj[k], skuNo, depth + 1); if (found) return found; } }
+  return null;
 }
 
-function resetSession() {
-  try {
-    globalCookieJar = new CookieJar();
-    cookieAxios = wrapper(axios.create({ jar: globalCookieJar, withCredentials: true }));
-    sessionInitialized = false;
-    return { ok: true, new_status: getCookieStatus() };
-  } catch (e) { return { ok: false, error: e.message }; }
+function getCookieStatus() {
+  return { cookie_required: false, primary_source: 'web.zkh360.com POST API (无WAF)', fallback_sources: ['分类列表页', 'CF Worker', '代理池', '直连'], cf_worker_configured: !!CF_WORKER_URL, proxy_enabled: USE_PROXY && proxyManager.isEnabled() };
 }
+function resetSession() { return { ok: true, message: 'no cookie session to reset (zkh360-api mode)' }; }
 
 module.exports = { searchProducts, getProductDetail, getCookieStatus, resetSession };
