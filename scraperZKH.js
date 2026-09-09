@@ -27,10 +27,11 @@ const DESKTOP_UAS = [
 ];
 
 // ============ 超时与并发策略（参考1688/xfs项目）============
-const SINGLE_TIMEOUT = 12000;        // 单次请求 12s
-const TOTAL_TIMEOUT = 60000;         // 单个用户请求绝对截止 60s（60s 后才允许直连兜底）
+const SINGLE_TIMEOUT = 10000;        // 单次请求 10s（免费代理快速判定失败，加快切换到直连）
+const TOTAL_TIMEOUT = 60000;         // 单个用户请求绝对截止 60s
+const MIN_DIRECT_TIMEOUT = 25000;    // 兜底直连至少保留 25s，保证直连有足够时间返回数据
 const CONCURRENT = 6;                // 每轮并发6个代理（提升命中率，加快返回）
-const MAX_ROUNDS = 30;               // 最大30轮（实际由 totalTimeout 控制截止）
+const MAX_ROUNDS = 20;               // 最大20轮（剩余时间足以兜底直连时提前进入直连）
 
 function randomUA() { return DESKTOP_UAS[Math.floor(Math.random() * DESKTOP_UAS.length)]; }
 
@@ -46,13 +47,36 @@ async function requestWithProxyRace(requestFn, options = {}) {
   const attemptedProxies = [];
   const elapsed = () => Date.now() - startTime;
 
-  // 代理池为空时：强制刷新代理池（保证一定先走代理，不直接直连）
-  if (proxyManager.getNextProxy() === null) {
-    console.log('[ZKH] 代理池为空，强制刷新代理池...');
-    try { await proxyManager.refreshProxies(true); } catch (e) { console.warn('[ZKH] 刷新代理池异常:', e.message); }
+  // 兜底直连函数：直连超时 = 总超时剩余时间，但至少保留 MIN_DIRECT_TIMEOUT，
+  // 保证直连有充足时间拿到数据，避免"代理占满60s后直连没时间"导致无输出。
+  async function directRequest(tag) {
+    const remain = totalTimeout - elapsed();
+    const directTimeout = Math.max(MIN_DIRECT_TIMEOUT, remain);
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), directTimeout);
+    try {
+      const result = await requestFn(null, controller.signal);
+      clearTimeout(abortTimer);
+      return { ...result, data_version: DATA_VERSION, proxy_used: tag, elapsed: (elapsed() / 1000).toFixed(2), attempted_proxies: attemptedProxies };
+    } catch (error) {
+      clearTimeout(abortTimer);
+      return {
+        success: false,
+        error: `${tag}失败: ${error.message}`,
+        data_version: DATA_VERSION,
+        proxy_used: null,
+        elapsed: (elapsed() / 1000).toFixed(2),
+        attempted_proxies: attemptedProxies,
+      };
+    }
   }
 
-  // 每轮从代理池取一批（knownGood 优先），代理不足时刷新后再取
+  // 代理池为空：直接直连（与1688/Amazon方案一致，保证有输出）
+  if (proxyManager.getNextProxy() === null) {
+    console.log('[ZKH] 代理池为空，直连模式');
+    return directRequest('direct');
+  }
+
   function getProxyBatch(count) {
     const batch = [];
     const seen = new Set();
@@ -60,24 +84,19 @@ async function requestWithProxyRace(requestFn, options = {}) {
       const p = proxyManager.getNextProxy();
       if (p && !seen.has(p)) { batch.push(p); seen.add(p); }
     }
-    if (batch.length < count) {
-      try { proxyManager.refreshProxies(false); } catch {}
-    }
     return batch;
   }
 
   for (let round = 0; round < maxRounds; round++) {
-    if (elapsed() >= totalTimeout) {
-      console.warn(`[ZKH] 达 ${(totalTimeout / 1000).toFixed(0)}s 总超时`);
-      break;
+    // 剩余时间不足以再跑一轮代理 + 直连保底时，提前进入直连兜底
+    if (elapsed() >= totalTimeout - MIN_DIRECT_TIMEOUT) {
+      console.warn(`[ZKH] 剩余时间不足，提前直连兜底 (已用${(elapsed() / 1000).toFixed(1)}s)`);
+      return directRequest('direct-fallback');
     }
 
-    let batch = getProxyBatch(concurrent);
+    const batch = getProxyBatch(concurrent);
     if (batch.length === 0) {
-      // 代理池暂空：强制刷新后重试，直到 60s 超时
-      try { await proxyManager.refreshProxies(true); } catch {}
-      await new Promise(r => setTimeout(r, 300 + Math.random() * 400));
-      continue;
+      return directRequest('direct-fallback');
     }
 
     console.log(`[ZKH] 第${round + 1}轮: 并发${batch.length}代理竞态...`);
@@ -115,7 +134,7 @@ async function requestWithProxyRace(requestFn, options = {}) {
           } else {
             proxyManager.markBad(proxy, isSevereError(result.error));
             attemptedProxies.push({ proxy, status: 'failed', time, error: result.error });
-            if (doneCount >= tasks.length || elapsed() >= totalTimeout) resolve();
+            if (doneCount >= tasks.length) resolve();
           }
         });
       });
@@ -132,29 +151,14 @@ async function requestWithProxyRace(requestFn, options = {}) {
       };
     }
 
-    if (elapsed() >= totalTimeout) break;
-    await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
+    // 每2轮刷新代理池
+    if (round % 2 === 1) {
+      try { await proxyManager.refreshProxies(false); } catch {}
+    }
   }
 
-  // 到达 60s 总超时，最后才允许直连兜底（保证可用性，且仅在真正超时后执行）
-  console.log('[ZKH] 代理 60s 超时仍未成功，最后直连兜底...');
-  const controller = new AbortController();
-  const abortTimer = setTimeout(() => controller.abort(), SINGLE_TIMEOUT);
-  try {
-    const result = await requestFn(null, controller.signal);
-    clearTimeout(abortTimer);
-    return { ...result, data_version: DATA_VERSION, proxy_used: 'direct-fallback', elapsed: (elapsed() / 1000).toFixed(2), attempted_proxies: attemptedProxies };
-  } catch (error) {
-    clearTimeout(abortTimer);
-    return {
-      success: false,
-      error: `代理 60s 未成功 + 直连兜底失败: ${error.message}`,
-      data_version: DATA_VERSION,
-      proxy_used: null,
-      elapsed: (elapsed() / 1000).toFixed(2),
-      attempted_proxies: attemptedProxies,
-    };
-  }
+  // 所有轮次用完仍未成功，直连兜底
+  return directRequest('direct-fallback');
 }
 
 // ============ WAF 检测 ============
