@@ -8,6 +8,8 @@ try { SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent; } catch { 
 class ProxyManager {
   constructor() {
     this.knownGoodProxies = [];
+    this.knownGoodIndex = 0;          // knownGood 独立轮询游标（优先复用已验证代理）
+    this.knownGoodMax = 40;           // knownGood 最多保留 40 个，保证内存与质量
     this.proxies = [...this.knownGoodProxies];
     this.badProxies = new Map(); // proxy -> { ts, severity }
     this.enabled = true; // 强制开启代理
@@ -76,13 +78,23 @@ class ProxyManager {
     return config;
   }
 
-  // 轮询获取下一个代理
+  // 轮询获取下一个代理（优先 knownGood，失败回退全池）
   getNextProxy() {
-    if (!this.enabled || this.proxies.length === 0) return null;
+    if (!this.enabled) return null;
     const now = Date.now();
-    for (let i = 0; i < this.proxies.length; i++) {
-      this.proxyIndex = (this.proxyIndex + 1) % this.proxies.length;
-      const candidate = this.proxies[this.proxyIndex];
+    // 优先从已验证可用的 knownGood 池取，提高成功率与速度
+    let p = this.pickFromPool(this.knownGoodProxies, this.knownGoodIndex, now, pidx => { this.knownGoodIndex = pidx; });
+    if (p) return p;
+    // knownGood 暂不可用（被标记坏/超用），回退全池
+    return this.pickFromPool(this.proxies, this.proxyIndex, now, pidx => { this.proxyIndex = pidx; });
+  }
+  // 从指定池按游标轮询一个可用代理
+  pickFromPool(pool, cursor, now, setCursor) {
+    if (!pool || pool.length === 0) return null;
+    for (let i = 0; i < pool.length; i++) {
+      const idx = (cursor + i) % pool.length;
+      setCursor(idx);
+      const candidate = pool[idx];
       const bad = this.badProxies.get(candidate);
       if (bad) {
         const ttlSec = bad.severity === 'severe' ? this.badProxyTTLSevere : this.badProxyTTL;
@@ -96,17 +108,25 @@ class ProxyManager {
       this.usedCount.set(candidate, uses + 1);
       return candidate;
     }
-    // 全坏了，清除坏代理
+    // 全坏：清空坏列表后返回第一个
     this.badProxies.clear();
-    return this.proxies[0] || null;
+    return pool[0] || null;
   }
 
   markBad(proxy, severe = false) {
     if (proxy) this.badProxies.set(proxy, { ts: Date.now(), severity: severe ? 'severe' : 'normal' });
   }
 
+  // 标记好代理：从坏名单移除，并累积到 knownGood 优先复用
   markGood(proxy) {
-    if (proxy && this.badProxies.has(proxy)) this.badProxies.delete(proxy);
+    if (!proxy) return;
+    if (this.badProxies.has(proxy)) this.badProxies.delete(proxy);
+    if (!this.knownGoodProxies.includes(proxy)) {
+      this.knownGoodProxies.unshift(proxy);
+      if (this.knownGoodProxies.length > this.knownGoodMax) this.knownGoodProxies.pop();
+      // 同步到全池，保证可用
+      if (!this.proxies.includes(proxy)) this.proxies.push(proxy);
+    }
   }
 
   // ============ 13源免费代理池（与1688方案一致）============

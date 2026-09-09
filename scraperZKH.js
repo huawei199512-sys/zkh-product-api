@@ -15,8 +15,9 @@ const proxyManager = require('./proxyManager');
 const ZKH_BASE = 'https://www.zkh.com';
 const ZKH360_API = 'https://web.zkh360.com';
 const ZKH360_SEARCH_API = ZKH360_API + '/api/search/listProductInfo';
-
-// 代理强制开启（不可关闭）
+// 数据版本：用于线上核对代码是否生效（修改后必升）
+const DATA_VERSION = '9.1.0-proxy-turbo';
+// 代理强制开启（不可关闭）——优先代理，60s 超时后才允许直连兜底
 const FORCE_PROXY = true;
 
 const DESKTOP_UAS = [
@@ -27,9 +28,9 @@ const DESKTOP_UAS = [
 
 // ============ 超时与并发策略（参考1688/xfs项目）============
 const SINGLE_TIMEOUT = 12000;        // 单次请求 12s
-const TOTAL_TIMEOUT = 60000;         // 单个用户请求绝对截止 60s
-const CONCURRENT = 3;                // 每轮并发3个代理
-const MAX_ROUNDS = 8;                // 最大8轮
+const TOTAL_TIMEOUT = 60000;         // 单个用户请求绝对截止 60s（60s 后才允许直连兜底）
+const CONCURRENT = 6;                // 每轮并发6个代理（提升命中率，加快返回）
+const MAX_ROUNDS = 30;               // 最大30轮（实际由 totalTimeout 控制截止）
 
 function randomUA() { return DESKTOP_UAS[Math.floor(Math.random() * DESKTOP_UAS.length)]; }
 
@@ -41,50 +42,42 @@ async function requestWithProxyRace(requestFn, options = {}) {
     totalTimeout = TOTAL_TIMEOUT,
   } = options;
 
-  // 代理未启用或无代理 → 直连
-  if (!proxyManager.isEnabled() || proxyManager.getNextProxy() === null) {
-    console.log('[ZKH] 直连模式（代理池为空，回退直连）');
-    const controller = new AbortController();
-    const abortTimer = setTimeout(() => controller.abort(), totalTimeout);
-    try {
-      const result = await requestFn(null, controller.signal);
-      clearTimeout(abortTimer);
-      return { ...result, proxy_used: 'direct' };
-    } catch (error) {
-      clearTimeout(abortTimer);
-      return { success: false, error: error.message, proxy_used: 'direct' };
-    }
+  const startTime = Date.now();
+  const attemptedProxies = [];
+  const elapsed = () => Date.now() - startTime;
+
+  // 代理池为空时：强制刷新代理池（保证一定先走代理，不直接直连）
+  if (proxyManager.getNextProxy() === null) {
+    console.log('[ZKH] 代理池为空，强制刷新代理池...');
+    try { await proxyManager.refreshProxies(true); } catch (e) { console.warn('[ZKH] 刷新代理池异常:', e.message); }
   }
 
-  // 代理竞态模式
-  const startTime = Date.now();
-  const seenProxies = new Set();
-  const attemptedProxies = [];
-
+  // 每轮从代理池取一批（knownGood 优先），代理不足时刷新后再取
   function getProxyBatch(count) {
     const batch = [];
-    for (let i = 0; i < count; i++) {
+    const seen = new Set();
+    for (let i = 0; i < count * 4 && batch.length < count; i++) {
       const p = proxyManager.getNextProxy();
-      if (p && !seenProxies.has(p)) {
-        batch.push(p);
-        seenProxies.add(p);
-      }
+      if (p && !seen.has(p)) { batch.push(p); seen.add(p); }
+    }
+    if (batch.length < count) {
+      try { proxyManager.refreshProxies(false); } catch {}
     }
     return batch;
   }
 
   for (let round = 0; round < maxRounds; round++) {
-    const elapsed = Date.now() - startTime;
-    if (elapsed >= totalTimeout) {
-      console.warn(`[ZKH] 总超时 (${(elapsed / 1000).toFixed(1)}s)`);
+    if (elapsed() >= totalTimeout) {
+      console.warn(`[ZKH] 达 ${(totalTimeout / 1000).toFixed(0)}s 总超时`);
       break;
     }
 
     let batch = getProxyBatch(concurrent);
     if (batch.length === 0) {
-      seenProxies.clear();
-      batch = getProxyBatch(concurrent);
-      if (batch.length === 0) break;
+      // 代理池暂空：强制刷新后重试，直到 60s 超时
+      try { await proxyManager.refreshProxies(true); } catch {}
+      await new Promise(r => setTimeout(r, 300 + Math.random() * 400));
+      continue;
     }
 
     console.log(`[ZKH] 第${round + 1}轮: 并发${batch.length}代理竞态...`);
@@ -101,10 +94,10 @@ async function requestWithProxyRace(requestFn, options = {}) {
     // Promise.race 竞态：第一个成功立即返回
     let successResult = null;
     await new Promise((resolve) => {
-      let resolved = false;
-      let failCount = 0;
-      tasks.forEach(({ proxy, promise }) => {
+      let resolved = false, doneCount = 0;
+      tasks.forEach(({ proxy, promise, controller }) => {
         promise.then(({ result, controller }) => {
+          doneCount++;
           if (resolved) return;
           const time = ((Date.now() - roundStart) / 1000).toFixed(2);
           if (result.success) {
@@ -122,45 +115,43 @@ async function requestWithProxyRace(requestFn, options = {}) {
           } else {
             proxyManager.markBad(proxy, isSevereError(result.error));
             attemptedProxies.push({ proxy, status: 'failed', time, error: result.error });
-            failCount++;
-            if (failCount >= batch.length) resolve();
+            if (doneCount >= tasks.length || elapsed() >= totalTimeout) resolve();
           }
         });
       });
     });
 
     if (successResult) {
-      console.log(`[ZKH] ✅ 代理成功: ${successResult.proxy} (${successResult.time}s)`);
+      console.log(`[ZKH] ✅ 代理成功: ${successResult.proxy} (${successResult.time}s, 累计耗时${(elapsed() / 1000).toFixed(1)}s)`);
       return {
         ...successResult.result,
+        data_version: DATA_VERSION,
         proxy_used: successResult.proxy,
-        elapsed: ((Date.now() - startTime) / 1000).toFixed(2),
+        elapsed: (elapsed() / 1000).toFixed(2),
         attempted_proxies: attemptedProxies,
       };
     }
 
-    // 每2轮刷新代理池
-    if (round % 2 === 1) {
-      try { await proxyManager.refreshProxies(false); } catch {}
-    }
-    await new Promise(r => setTimeout(r, 300 + Math.random() * 400));
+    if (elapsed() >= totalTimeout) break;
+    await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
   }
 
-  // 所有代理失败，回退直连
-  console.log('[ZKH] 所有代理失败，回退直连...');
+  // 到达 60s 总超时，最后才允许直连兜底（保证可用性，且仅在真正超时后执行）
+  console.log('[ZKH] 代理 60s 超时仍未成功，最后直连兜底...');
   const controller = new AbortController();
   const abortTimer = setTimeout(() => controller.abort(), SINGLE_TIMEOUT);
   try {
     const result = await requestFn(null, controller.signal);
     clearTimeout(abortTimer);
-    return { ...result, proxy_used: 'direct-fallback', elapsed: ((Date.now() - startTime) / 1000).toFixed(2), attempted_proxies: attemptedProxies };
+    return { ...result, data_version: DATA_VERSION, proxy_used: 'direct-fallback', elapsed: (elapsed() / 1000).toFixed(2), attempted_proxies: attemptedProxies };
   } catch (error) {
     clearTimeout(abortTimer);
     return {
       success: false,
-      error: `所有代理失败 (${attemptedProxies.length}个) + 直连失败: ${error.message}`,
+      error: `代理 60s 未成功 + 直连兜底失败: ${error.message}`,
+      data_version: DATA_VERSION,
       proxy_used: null,
-      elapsed: ((Date.now() - startTime) / 1000).toFixed(2),
+      elapsed: (elapsed() / 1000).toFixed(2),
       attempted_proxies: attemptedProxies,
     };
   }
@@ -645,6 +636,7 @@ function formatSearchResult(result, keyword, page, pageSize) {
     return {
       success: false,
       error: (result && result.error) || '搜索失败',
+      data_version: DATA_VERSION,
       keyword,
       page: Number(page),
       page_size: Number(pageSize),
@@ -657,6 +649,7 @@ function formatSearchResult(result, keyword, page, pageSize) {
   return {
     success: true,
     source: result.source,
+    data_version: DATA_VERSION,
     proxy_used: result.proxy_used || null,
     elapsed: result.elapsed || null,
     ...result.data,
@@ -687,14 +680,14 @@ async function getProductDetail(skuNo) {
   // 备选：HTML详情页解析（通过代理竞态）
   const htmlResult = await fetchZKHPageViaProxy(`/item/${skuNo}.html`, '', ZKH_BASE + '/');
   if (!htmlResult.success) {
-    return { success: false, error: htmlResult.error || '详情获取失败', sku_no: skuNo };
+    return { success: false, data_version: DATA_VERSION, error: htmlResult.error || '详情获取失败', sku_no: skuNo };
   }
 
   const parsed = parseDetailFromHtml(htmlResult.data, skuNo);
   if (!parsed) {
-    return { success: false, error: '详情页解析失败（可能WAF或页面结构变更）', sku_no: skuNo };
+    return { success: false, data_version: DATA_VERSION, error: '详情页解析失败（可能WAF或页面结构变更）', sku_no: skuNo };
   }
-  return { success: true, source: htmlResult.source, proxy_used: htmlResult.proxy_used, ...parsed };
+  return { success: true, source: htmlResult.source, data_version: DATA_VERSION, proxy_used: htmlResult.proxy_used, ...parsed };
 }
 
 // 构建完整详情结果（参考1688字段结构）
@@ -703,6 +696,7 @@ function buildDetailResult(match, proxyUsed) {
   return {
     success: true,
     source: 'zkh360-api',
+    data_version: DATA_VERSION,
     proxy_used: proxyUsed || null,
     sku_no: match.sku_no,
     title: match.title,

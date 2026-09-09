@@ -8,7 +8,7 @@ const proxyManager = require('./proxyManager');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
-const VERSION = '9.0.0-full-fields-raw-data';
+const VERSION = '9.1.0-proxy-turbo';
 
 app.use(cors());
 app.use(express.json());
