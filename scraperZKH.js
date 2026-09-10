@@ -170,6 +170,14 @@ async function requestWithProxyRace(requestFn, options = {}) {
     // 条件1: 连续2轮失败且无knownGood → 立即直连
     // 条件2: 连续3轮失败（knownGood有货但连续失效）→ 立即直连，保证总耗时≈3×10s+25s≈55s内
     consecutiveFailRounds++;
+    const has403 = attemptedProxies.some(a => a.error && String(a.error).includes('403'));
+    // 403 风控场景：直连IP已被风控（直连必失败），刷新代理池换新IP重试，而非直接直连
+    if (has403 && round < maxRounds - 1 && (consecutiveFailRounds >= 2 && proxyManager.getKnownGoodCount() === 0)) {
+      console.warn(`[ZKH] 检测到403风控，刷新代理池追加新IP重试...`);
+      consecutiveFailRounds = 0;
+      try { await proxyManager.refreshProxies(true); } catch {}
+      continue;
+    }
     if (consecutiveFailRounds >= 3 || (consecutiveFailRounds >= 2 && proxyManager.getKnownGoodCount() === 0)) {
       console.warn(`[ZKH] 连续${consecutiveFailRounds}轮代理失败，立即直连兜底 (已用${(elapsed() / 1000).toFixed(1)}s)`);
       return directRequest('direct-fallback');
