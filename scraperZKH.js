@@ -153,9 +153,11 @@ async function requestWithProxyRace(requestFn, options = {}) {
     }
 
     // 连续失败快速兜底：避免代理全坏时空转占满剩余时间
+    // 条件1: 连续2轮失败且无knownGood → 立即直连
+    // 条件2: 连续3轮失败（knownGood有货但连续失效）→ 立即直连，保证总耗时≈3×10s+25s≈55s内
     consecutiveFailRounds++;
-    if (consecutiveFailRounds >= 2 && proxyManager.getKnownGoodCount() === 0) {
-      console.warn(`[ZKH] 连续${consecutiveFailRounds}轮代理失败且无knownGood，立即直连兜底 (已用${(elapsed() / 1000).toFixed(1)}s)`);
+    if (consecutiveFailRounds >= 3 || (consecutiveFailRounds >= 2 && proxyManager.getKnownGoodCount() === 0)) {
+      console.warn(`[ZKH] 连续${consecutiveFailRounds}轮代理失败，立即直连兜底 (已用${(elapsed() / 1000).toFixed(1)}s)`);
       return directRequest('direct-fallback');
     }
 
@@ -679,12 +681,12 @@ async function getProductDetail(skuNo) {
     );
     if (match) {
       console.log(`[Detail] ✅ zkh360 API 成功: sku=${skuNo}, proxy=${apiResult.proxy_used}`);
-      return buildDetailResult(match, apiResult.proxy_used);
+      return buildDetailResult(match, apiResult.proxy_used, apiResult.elapsed);
     }
     // 未精确匹配，返回第一个候选
     if (apiResult.data.products.length > 0) {
       console.log(`[Detail] 未精确匹配SKU=${skuNo}，返回候选: ${apiResult.data.products[0].sku_no}`);
-      return buildDetailResult(apiResult.data.products[0], apiResult.proxy_used);
+      return buildDetailResult(apiResult.data.products[0], apiResult.proxy_used, apiResult.elapsed);
     }
   }
   console.log(`[Detail] zkh360 API 未找到SKU=${skuNo}: ${apiResult.error}，尝试HTML详情页...`);
@@ -699,17 +701,18 @@ async function getProductDetail(skuNo) {
   if (!parsed) {
     return { success: false, data_version: DATA_VERSION, error: '详情页解析失败（可能WAF或页面结构变更）', sku_no: skuNo };
   }
-  return { success: true, source: htmlResult.source, data_version: DATA_VERSION, proxy_used: htmlResult.proxy_used, ...parsed };
+  return { success: true, source: htmlResult.source, data_version: DATA_VERSION, proxy_used: htmlResult.proxy_used, elapsed: htmlResult.elapsed || null, ...parsed };
 }
 
 // 构建完整详情结果（参考1688字段结构）
-function buildDetailResult(match, proxyUsed) {
+function buildDetailResult(match, proxyUsed, elapsedTime) {
   const specs = match.specs || {};
   return {
     success: true,
     source: 'zkh360-api',
     data_version: DATA_VERSION,
     proxy_used: proxyUsed || null,
+    elapsed: elapsedTime || null,
     sku_no: match.sku_no,
     title: match.title,
     description: match.description || match.sub_title || '',
