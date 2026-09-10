@@ -34,6 +34,24 @@ const MAX_ROUNDS = 20;               // 最大20轮
 
 function randomUA() { return DESKTOP_UAS[Math.floor(Math.random() * DESKTOP_UAS.length)]; }
 
+// ============ 设备指纹（Device Fingerprint）============
+// 模拟浏览器端采集特征生成稳定指纹：内核版本段 + 时区 + 屏幕特征 + 随机种子 -> sha1/md5 哈希
+function generateFingerprint() {
+  const chromium = DESKTOP_UAS.some(u => u.includes('Chrome/126')) ? 126 : 127;
+  const sha = (str) => {
+    const crypto = require('crypto');
+    return crypto.createHash('sha1').update(str).digest('hex').slice(0, 40);
+  };
+  const seed = Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
+  const fp = sha(chromium + '|' + seed);
+  return fp;
+}
+
+// 生成 X-Forwarded-For（XFF）：随机内网保留段 IP，避免把真实/机房 IP 暴露给目标站
+function randomPrivateIP() {
+  return '10.' + (Math.floor(Math.random() * 200) + 1) + '.' + (Math.floor(Math.random() * 255) + 1) + '.' + (Math.floor(Math.random() * 254) + 1);
+}
+
 // ============ 代理竞态请求（参考1688 requestWithProxyRace）============
 async function requestWithProxyRace(requestFn, options = {}) {
   const {
@@ -225,6 +243,12 @@ async function searchViaZKH360API(keyword, page = 1, pageSize = 40) {
         'Accept': 'application/json',
         'Origin': ZKH360_API,
         'Referer': ZKH360_API + '/',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Sec-Ch-Ua': '"Chromium";v="127", "Not)A;Brand";v="99"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'X-Forwarded-For': randomPrivateIP(),
+        'X-Device-Fingerprint': generateFingerprint(),
       },
       timeout: SINGLE_TIMEOUT,
       signal: abortSignal,
@@ -541,6 +565,8 @@ function buildHeaders(referer) {
     'Sec-Fetch-Site': 'none',
     'Sec-Fetch-User': '?1',
     'Upgrade-Insecure-Requests': '1',
+    'X-Forwarded-For': randomPrivateIP(),
+    'X-Device-Fingerprint': generateFingerprint(),
     'Referer': referer || (ZKH_BASE + '/'),
   };
 }
