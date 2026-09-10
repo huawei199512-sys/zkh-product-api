@@ -87,6 +87,7 @@ async function requestWithProxyRace(requestFn, options = {}) {
     return batch;
   }
 
+  let consecutiveFailRounds = 0;
   for (let round = 0; round < maxRounds; round++) {
     // 剩余时间不足以再跑一轮代理 + 直连保底时，提前进入直连兜底
     if (elapsed() >= totalTimeout - MIN_DIRECT_TIMEOUT) {
@@ -149,6 +150,13 @@ async function requestWithProxyRace(requestFn, options = {}) {
         elapsed: (elapsed() / 1000).toFixed(2),
         attempted_proxies: attemptedProxies,
       };
+    }
+
+    // 连续失败快速兜底：避免代理全坏时空转占满剩余时间
+    consecutiveFailRounds++;
+    if (consecutiveFailRounds >= 2 && proxyManager.getKnownGoodCount() === 0) {
+      console.warn(`[ZKH] 连续${consecutiveFailRounds}轮代理失败且无knownGood，立即直连兜底 (已用${(elapsed() / 1000).toFixed(1)}s)`);
+      return directRequest('direct-fallback');
     }
 
     // 每2轮刷新代理池

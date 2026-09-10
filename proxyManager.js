@@ -13,7 +13,7 @@ class ProxyManager {
     this.proxies = [...this.knownGoodProxies];
     this.badProxies = new Map(); // proxy -> { ts, severity }
     this.enabled = true; // 强制开启代理
-    this.maxUsesPerProxy = 5;
+    this.maxUsesPerProxy = 8;
     this.usedCount = new Map();
     this.lastRefreshTime = 0;
     this.refreshInterval = 300; // 5分钟最小刷新间隔
@@ -39,6 +39,8 @@ class ProxyManager {
 
   setEnabled(enabled) { this.enabled = enabled; }
   isEnabled() { return this.enabled; }
+
+  getKnownGoodCount() { return this.knownGoodProxies.length; }
 
   getStatus() {
     const httpCount = this.proxies.filter(p => !p.startsWith('socks')).length;
