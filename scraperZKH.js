@@ -16,7 +16,7 @@ const ZKH_BASE = 'https://www.zkh.com';
 const ZKH360_API = 'https://web.zkh360.com';
 const ZKH360_SEARCH_API = ZKH360_API + '/api/search/listProductInfo';
 // 数据版本：用于线上核对代码是否生效（修改后必升）
-const DATA_VERSION = '9.1.0-proxy-turbo';
+const DATA_VERSION = '9.1.1-race-fix';
 // 代理强制开启（不可关闭）——优先代理，60s 超时后才允许直连兜底
 const FORCE_PROXY = true;
 
@@ -105,7 +105,14 @@ async function requestWithProxyRace(requestFn, options = {}) {
 
     const tasks = batch.map((proxy) => {
       const controller = new AbortController();
-      const promise = requestFn(proxy, controller.signal)
+      // 硬超时：防止代理挂起导致竞态永不settle（死锁）
+      const hardTimeout = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('proxy-hang-timeout')), SINGLE_TIMEOUT + 2000);
+      });
+      const promise = Promise.race([
+        requestFn(proxy, controller.signal),
+        hardTimeout,
+      ])
         .then((result) => ({ proxy, result, controller }))
         .catch((error) => ({ proxy, result: { success: false, error: error.message }, controller }));
       return { proxy, promise, controller };
@@ -113,33 +120,40 @@ async function requestWithProxyRace(requestFn, options = {}) {
 
     // Promise.race 竞态：第一个成功立即返回
     let successResult = null;
-    await new Promise((resolve) => {
-      let resolved = false, doneCount = 0;
-      tasks.forEach(({ proxy, promise, controller }) => {
-        promise.then(({ result, controller }) => {
-          doneCount++;
-          if (resolved) return;
-          const time = ((Date.now() - roundStart) / 1000).toFixed(2);
-          if (result.success) {
-            resolved = true;
-            successResult = { proxy, result, time };
-            proxyManager.markGood(proxy);
-            attemptedProxies.push({ proxy, status: 'success', time });
-            // 中止其他任务
-            tasks.forEach((t) => {
-              if (t.proxy !== proxy) {
-                try { t.controller.abort(); } catch {}
-              }
-            });
-            resolve();
-          } else {
-            proxyManager.markBad(proxy, isSevereError(result.error));
-            attemptedProxies.push({ proxy, status: 'failed', time, error: result.error });
-            if (doneCount >= tasks.length) resolve();
-          }
-        });
-      });
+    // 整体保险：无论任何情况，本轮最迟 SINGLE_TIMEOUT+4s 内必须 resolve
+    const roundGuard = new Promise((resolve) => {
+      setTimeout(resolve, SINGLE_TIMEOUT + 4000);
     });
+    await Promise.race([
+      new Promise((resolve) => {
+        let resolved = false, doneCount = 0;
+        tasks.forEach(({ proxy, promise, controller }) => {
+          promise.then(({ result, controller }) => {
+            doneCount++;
+            if (resolved) return;
+            const time = ((Date.now() - roundStart) / 1000).toFixed(2);
+            if (result.success) {
+              resolved = true;
+              successResult = { proxy, result, time };
+              proxyManager.markGood(proxy);
+              attemptedProxies.push({ proxy, status: 'success', time });
+              // 中止其他任务
+              tasks.forEach((t) => {
+                if (t.proxy !== proxy) {
+                  try { t.controller.abort(); } catch {}
+                }
+              });
+              resolve();
+            } else {
+              proxyManager.markBad(proxy, isSevereError(result.error));
+              attemptedProxies.push({ proxy, status: 'failed', time, error: result.error });
+              if (doneCount >= tasks.length) resolve();
+            }
+          });
+        });
+      }),
+      roundGuard,
+    ]);
 
     if (successResult) {
       console.log(`[ZKH] ✅ 代理成功: ${successResult.proxy} (${successResult.time}s, 累计耗时${(elapsed() / 1000).toFixed(1)}s)`);
